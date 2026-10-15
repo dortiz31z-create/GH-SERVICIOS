@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Entorno virtual
+backend/.venv/
+
+# Variables de entorno
+backend/.env
+
+# Cursor / VS Code
+.vscode/
+.cursor/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
