@@ -12,6 +12,11 @@ from app.models.pagador import Pagador
 from app.models.banco import Banco
 from app.models.importacion_sii import ImportacionSII
 from app.models.documento_tributario import DocumentoTributario
+from app.models.cuenta_bancaria_gh import CuentaBancariaGH
+from app.models.importacion_bancaria import ImportacionBancaria
+from app.models.movimiento_bancario import MovimientoBancario
+from app.models.pago import Pago
+from app.models.conciliacion import Conciliacion
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
