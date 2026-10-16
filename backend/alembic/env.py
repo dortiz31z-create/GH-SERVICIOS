@@ -8,6 +8,10 @@ from app.core.config import settings
 from app.models.base import Base
 from app.models.usuario import Usuario
 from app.models.cliente import Cliente
+from app.models.pagador import Pagador
+from app.models.banco import Banco
+from app.models.importacion_sii import ImportacionSII
+from app.models.documento_tributario import DocumentoTributario
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
