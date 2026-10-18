@@ -1,6 +1,14 @@
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String
+from sqlalchemy import (
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -9,6 +17,15 @@ from app.models.base import Base
 class DocumentoTributario(Base):
     __tablename__ = "documentos_tributarios"
 
+    __table_args__ = (
+        UniqueConstraint(
+            "rut_empresa",
+            "tipo_documento",
+            "folio",
+            name="uq_documento_rut_empresa_tipo_folio",
+        ),
+    )
+
     id: Mapped[int] = mapped_column(
         primary_key=True,
         autoincrement=True,
@@ -16,6 +33,12 @@ class DocumentoTributario(Base):
 
     importacion_sii_id: Mapped[int] = mapped_column(
         ForeignKey("importaciones_sii.id"),
+        nullable=False,
+        index=True,
+    )
+
+    rut_empresa: Mapped[str] = mapped_column(
+        String(20),
         nullable=False,
         index=True,
     )

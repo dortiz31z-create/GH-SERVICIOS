@@ -31,6 +31,13 @@ class ImportacionSII(Base):
         nullable=False,
     )
 
+    hash_archivo: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+
     cantidad_registros: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
