@@ -1554,6 +1554,38 @@ def detectar_rut_en_texto(texto: str | None) -> str | None:
 
     return None
 
+@app.get("/api/movimientos-bancarios")
+def listar_movimientos_bancarios(solo_sin_rut: bool = False):
+    with SessionLocal() as db:
+        query = select(MovimientoBancario).order_by(
+            MovimientoBancario.fecha_movimiento.desc(),
+            MovimientoBancario.id.desc(),
+        )
+
+        if solo_sin_rut:
+            query = query.where(
+                MovimientoBancario.rut_pagador_detectado.is_(None)
+            )
+
+        movimientos = db.scalars(query).all()
+
+        return [
+            {
+                "id": m.id,
+                "fecha_movimiento": m.fecha_movimiento,
+                "descripcion_original": m.descripcion_original,
+                "numero_documento": m.numero_documento,
+                "sucursal": m.sucursal,
+                "tipo_movimiento": m.tipo_movimiento,
+                "monto": m.monto,
+                "cargo_abono": m.cargo_abono,
+                "monto_abono": m.monto_abono,
+                "monto_cargo": m.monto_cargo,
+                "rut_pagador_detectado": m.rut_pagador_detectado,
+                "nombre_pagador_detectado": m.nombre_pagador_detectado,
+            }
+            for m in movimientos
+        ]
 
 @app.post("/api/movimientos-bancarios/importar-santander")
 

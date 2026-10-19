@@ -1,14 +1,8 @@
 from datetime import date, datetime
+from decimal import Decimal
 
-from sqlalchemy import (
-    Date,
-    DateTime,
-    ForeignKey,
-    Integer,
-    Numeric,
-    String,
-    UniqueConstraint,
-)
+from sqlalchemy import Date, Numeric, String, UniqueConstraint
+from sqlalchemy import ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -44,7 +38,6 @@ class DocumentoTributario(Base):
     )
 
     tipo_documento: Mapped[int] = mapped_column(
-        Integer,
         nullable=False,
         index=True,
     )
@@ -66,7 +59,6 @@ class DocumentoTributario(Base):
     )
 
     folio: Mapped[int] = mapped_column(
-        Integer,
         nullable=False,
         index=True,
     )
@@ -82,33 +74,31 @@ class DocumentoTributario(Base):
         nullable=True,
     )
 
-    monto_exento: Mapped[Numeric | None] = mapped_column(
+    monto_exento: Mapped[Decimal | None] = mapped_column(
         Numeric(15, 2),
         nullable=True,
     )
 
-    monto_neto: Mapped[Numeric | None] = mapped_column(
+    monto_neto: Mapped[Decimal | None] = mapped_column(
         Numeric(15, 2),
         nullable=True,
     )
 
-    monto_iva: Mapped[Numeric | None] = mapped_column(
+    monto_iva: Mapped[Decimal | None] = mapped_column(
         Numeric(15, 2),
         nullable=True,
     )
 
-    monto_total: Mapped[Numeric] = mapped_column(
+    monto_total: Mapped[Decimal] = mapped_column(
         Numeric(15, 2),
         nullable=False,
     )
 
     tipo_documento_referencia: Mapped[int | None] = mapped_column(
-        Integer,
         nullable=True,
     )
 
     folio_documento_referencia: Mapped[int | None] = mapped_column(
-        Integer,
         nullable=True,
     )
 
@@ -122,8 +112,32 @@ class DocumentoTributario(Base):
         nullable=True,
     )
 
+    # Información de crédito aplicada a esta factura.
+    # Estos valores quedan registrados en la factura y no
+    # dependen de cambios posteriores en la condición del cliente.
+
+    dias_credito_aplicado: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+    )
+
+    fecha_vencimiento: Mapped[date | None] = mapped_column(
+        Date,
+        nullable=True,
+    )
+
+    saldo_pendiente: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2),
+        nullable=False,
+    )
+
+    estado_pago: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="PENDIENTE",
+    )
+
     creado_en: Mapped[datetime] = mapped_column(
-        DateTime,
         nullable=False,
         default=datetime.utcnow,
     )
