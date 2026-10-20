@@ -15,6 +15,9 @@ import io
 import re
 
 from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
+from itertools import combinations
+from datetime import date, datetime
 
 
 
@@ -37,6 +40,7 @@ from app.models.movimiento_bancario import MovimientoBancario
 from app.models.importacion_bancaria import ImportacionBancaria
 
 from app.models.cuenta_bancaria_gh import CuentaBancariaGH
+from app.models.pagador import Pagador
 
 
 
@@ -184,7 +188,93 @@ class ClienteCreate(BaseModel):
 
     email: str | None = None
 
+class PagadorCreate(BaseModel):
+    cliente_id: int
+    rut_pagador: str
+    nombre_pagador: str
+    tipo: str = "empresa"
+    autorizado: bool = True
+    fecha_desde: date | None = None
+    fecha_hasta: date | None = None
+    observaciones: str | None = None
 
+
+@app.get("/api/pagadores")
+def listar_pagadores():
+    with SessionLocal() as db:
+        pagadores = db.scalars(
+            select(Pagador).order_by(Pagador.nombre_pagador)
+        ).all()
+
+        return [
+            {
+                "id": pagador.id,
+                "cliente_id": pagador.cliente_id,
+                "rut_pagador": pagador.rut_pagador,
+                "nombre_pagador": pagador.nombre_pagador,
+                "tipo": pagador.tipo,
+                "autorizado": pagador.autorizado,
+                "fecha_desde": pagador.fecha_desde,
+                "fecha_hasta": pagador.fecha_hasta,
+                "observaciones": pagador.observaciones,
+            }
+            for pagador in pagadores
+        ]
+
+
+@app.post("/api/pagadores")
+def crear_pagador(datos: PagadorCreate):
+    with SessionLocal() as db:
+        cliente = db.get(Cliente, datos.cliente_id)
+
+        if not cliente:
+            raise HTTPException(
+                status_code=404,
+                detail="El cliente indicado no existe.",
+            )
+
+        pagador_existente = db.scalar(
+            select(Pagador).where(
+                Pagador.cliente_id == datos.cliente_id,
+                Pagador.rut_pagador == datos.rut_pagador,
+            )
+        )
+
+        if pagador_existente:
+            raise HTTPException(
+                status_code=400,
+                detail="Ese RUT ya está registrado como pagador de este cliente.",
+            )
+
+        pagador = Pagador(
+            cliente_id=datos.cliente_id,
+            rut_pagador=datos.rut_pagador,
+            nombre_pagador=datos.nombre_pagador,
+            tipo=datos.tipo,
+            autorizado=datos.autorizado,
+            fecha_desde=datos.fecha_desde,
+            fecha_hasta=datos.fecha_hasta,
+            observaciones=datos.observaciones,
+        )
+
+        db.add(pagador)
+        db.commit()
+        db.refresh(pagador)
+
+        return {
+            "mensaje": "Pagador registrado correctamente.",
+            "pagador": {
+                "id": pagador.id,
+                "cliente_id": pagador.cliente_id,
+                "rut_pagador": pagador.rut_pagador,
+                "nombre_pagador": pagador.nombre_pagador,
+                "tipo": pagador.tipo,
+                "autorizado": pagador.autorizado,
+                "fecha_desde": pagador.fecha_desde,
+                "fecha_hasta": pagador.fecha_hasta,
+                "observaciones": pagador.observaciones,
+            },
+        }
 
 
 
@@ -1359,12 +1449,10 @@ async def importar_sii(
 
 
                     codigo_sucursal=normalizar_texto(
-
-                        fila.get("Codigo Sucursal")
-
-                    ),
-
-                )
+    fila.get("Codigo Sucursal")
+),
+saldo_pendiente=monto_total,
+)
 
 
 
@@ -1553,6 +1641,268 @@ def detectar_rut_en_texto(texto: str | None) -> str | None:
         return f"{cuerpo_sin_ceros}-{dv}"
 
     return None
+
+@app.get("/api/pagos/pendientes")
+def listar_abonos_pendientes_de_pago():
+    with SessionLocal() as db:
+        movimientos = db.scalars(
+            select(MovimientoBancario)
+            .where(MovimientoBancario.cargo_abono == "A")
+            .order_by(
+                MovimientoBancario.fecha_movimiento.desc(),
+                MovimientoBancario.id.desc(),
+            )
+        ).all()
+
+        pagos_existentes = {
+            pago.movimiento_bancario_id
+            for pago in db.scalars(select(Pago)).all()
+        }
+
+        return [
+            {
+                "movimiento_bancario_id": movimiento.id,
+                "fecha_movimiento": movimiento.fecha_movimiento,
+                "descripcion_original": movimiento.descripcion_original,
+                "numero_documento": movimiento.numero_documento,
+                "tipo_movimiento": movimiento.tipo_movimiento,
+                "monto": movimiento.monto,
+                "rut_pagador_detectado": movimiento.rut_pagador_detectado,
+                "nombre_pagador_detectado": movimiento.nombre_pagador_detectado,
+                "pago_creado": movimiento.id in pagos_existentes,
+            }
+            for movimiento in movimientos
+        ]
+
+@app.post("/api/pagos/crear-desde-abonos")
+def crear_pagos_desde_abonos():
+    with SessionLocal() as db:
+        movimientos = db.scalars(
+            select(MovimientoBancario)
+            .where(MovimientoBancario.cargo_abono == "A")
+            .order_by(
+                MovimientoBancario.fecha_movimiento.asc(),
+                MovimientoBancario.id.asc(),
+            )
+        ).all()
+
+        creados = 0
+        ya_existentes = 0
+
+        for movimiento in movimientos:
+            pago_existente = db.scalar(
+                select(Pago).where(
+                    Pago.movimiento_bancario_id == movimiento.id
+                )
+            )
+
+            if pago_existente:
+                ya_existentes += 1
+                continue
+
+            pago = Pago(
+                movimiento_bancario_id=movimiento.id,
+                cliente_id=None,
+                pagador_id=None,
+                fecha_pago=movimiento.fecha_movimiento,
+                monto_pago=movimiento.monto,
+                moneda="CLP",
+                medio_pago=movimiento.tipo_movimiento,
+                estado="pendiente",
+                observaciones=None,
+            )
+
+            db.add(pago)
+            creados += 1
+
+        db.commit()
+
+        return {
+            "mensaje": "Pagos creados desde abonos bancarios.",
+            "abonos_revisados": len(movimientos),
+            "pagos_creados": creados,
+            "pagos_ya_existentes": ya_existentes,
+        }
+
+@app.get("/api/pagos/{pago_id}/propuestas-conciliacion")
+def proponer_conciliaciones(pago_id: int):
+    with SessionLocal() as db:
+        pago = db.get(Pago, pago_id)
+
+        if not pago:
+            raise HTTPException(
+                status_code=404,
+                detail="El pago indicado no existe.",
+            )
+
+        movimiento = db.get(
+            MovimientoBancario,
+            pago.movimiento_bancario_id,
+        )
+
+        if not movimiento:
+            raise HTTPException(
+                status_code=404,
+                detail="No se encontró el movimiento bancario asociado.",
+            )
+
+        rut_pagador = movimiento.rut_pagador_detectado
+
+        if not rut_pagador:
+            return {
+                "pago_id": pago.id,
+                "mensaje": "El pago no tiene RUT de pagador detectado.",
+                "tipo_revision": "MANUAL",
+                "propuestas": [],
+            }
+
+        pagadores = db.scalars(
+            select(Pagador).where(
+                Pagador.rut_pagador == rut_pagador,
+                Pagador.autorizado.is_(True),
+            )
+        ).all()
+
+        if not pagadores:
+            return {
+                "pago_id": pago.id,
+                "rut_pagador": rut_pagador,
+                "mensaje": "El RUT del pagador no está asociado a ningún cliente autorizado.",
+                "tipo_revision": "MANUAL",
+                "propuestas": [],
+            }
+
+        clientes_ids = list(
+            dict.fromkeys(
+                pagador.cliente_id
+                for pagador in pagadores
+            )
+        )
+
+        clientes = {
+            cliente.id: cliente
+            for cliente in db.scalars(
+                select(Cliente).where(
+                    Cliente.id.in_(clientes_ids)
+                )
+            ).all()
+        }
+
+        propuestas = []
+
+        for cliente_id in clientes_ids:
+            cliente = clientes.get(cliente_id)
+
+            if not cliente:
+                continue
+
+            documentos = db.scalars(
+                select(DocumentoTributario)
+                .where(
+                    DocumentoTributario.rut_cliente == cliente.rut,
+                    DocumentoTributario.saldo_pendiente > 0,
+                )
+                .order_by(
+                    DocumentoTributario.fecha_documento.desc(),
+                    DocumentoTributario.folio.desc(),
+                )
+            ).all()
+
+            if not documentos:
+                continue
+
+            # Buscamos combinaciones de hasta 4 documentos.
+            # La fecha NO es un filtro excluyente.
+            limite_combinaciones = min(len(documentos), 20)
+            documentos_para_busqueda = documentos[:limite_combinaciones]
+
+            candidatos = []
+
+            for cantidad in range(1, 5):
+                if cantidad > len(documentos_para_busqueda):
+                    break
+
+                for grupo in combinations(
+                    documentos_para_busqueda,
+                    cantidad,
+                ):
+                    total = sum(
+                        Decimal(documento.saldo_pendiente)
+                        for documento in grupo
+                    )
+
+                    diferencia = total - Decimal(pago.monto_pago)
+
+                    candidatos.append(
+                        {
+                            "documentos": grupo,
+                            "total_aplicado": total,
+                            "diferencia": diferencia,
+                            "cantidad_documentos": cantidad,
+                        }
+                    )
+
+            # Primero las coincidencias exactas.
+            candidatos.sort(
+                key=lambda candidato: (
+                    abs(candidato["diferencia"]),
+                    candidato["cantidad_documentos"],
+                )
+            )
+
+            for candidato in candidatos[:10]:
+                diferencia = candidato["diferencia"]
+
+                if diferencia == 0:
+                    nivel = "ALTA"
+                    motivo = "Coincidencia exacta de monto."
+                elif abs(diferencia) <= Decimal("1000"):
+                    nivel = "MEDIA"
+                    motivo = "Monto muy cercano; requiere revisión."
+                else:
+                    nivel = "BAJA"
+                    motivo = "Existe diferencia de monto; requiere revisión."
+
+                propuestas.append(
+                    {
+                        "cliente_id": cliente.id,
+                        "cliente_rut": cliente.rut,
+                        "cliente_razon_social": cliente.razon_social,
+                        "nivel": nivel,
+                        "motivo": motivo,
+                        "monto_pago": pago.monto_pago,
+                        "total_documentos": candidato["total_aplicado"],
+                        "diferencia": diferencia,
+                        "documentos": [
+                            {
+                                "id": documento.id,
+                                "folio": documento.folio,
+                                "fecha_documento": documento.fecha_documento,
+                                "monto_total": documento.monto_total,
+                                "saldo_pendiente": documento.saldo_pendiente,
+                            }
+                            for documento in candidato["documentos"]
+                        ],
+                    }
+                )
+
+        propuestas.sort(
+            key=lambda propuesta: (
+                abs(Decimal(propuesta["diferencia"])),
+                len(propuesta["documentos"]),
+            )
+        )
+
+        return {
+            "pago_id": pago.id,
+            "fecha_pago": pago.fecha_pago,
+            "monto_pago": pago.monto_pago,
+            "movimiento_bancario_id": movimiento.id,
+            "rut_pagador": rut_pagador,
+            "nombre_pagador": movimiento.nombre_pagador_detectado,
+            "tipo_revision": "PROPUESTA",
+            "propuestas": propuestas[:20],
+        }
 
 @app.get("/api/movimientos-bancarios")
 def listar_movimientos_bancarios(solo_sin_rut: bool = False):

@@ -16,6 +16,7 @@ from app.models.cuenta_bancaria_gh import CuentaBancariaGH
 from app.models.importacion_bancaria import ImportacionBancaria
 from app.models.movimiento_bancario import MovimientoBancario
 from app.models.pago import Pago
+from app.models.aplicacion_pago import AplicacionPago
 from app.models.conciliacion import Conciliacion
 from app.models.tipo_cliente import TipoCliente
 from app.models.credito_cliente import CreditoCliente
