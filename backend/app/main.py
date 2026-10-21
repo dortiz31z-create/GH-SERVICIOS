@@ -41,6 +41,8 @@ from app.models.importacion_bancaria import ImportacionBancaria
 
 from app.models.cuenta_bancaria_gh import CuentaBancariaGH
 from app.models.pagador import Pagador
+from app.models.evaluacion_credito import EvaluacionCredito
+from app.models.documento_credito import DocumentoCredito
 
 
 
@@ -1767,7 +1769,10 @@ def proponer_conciliaciones(pago_id: int):
             return {
                 "pago_id": pago.id,
                 "rut_pagador": rut_pagador,
-                "mensaje": "El RUT del pagador no está asociado a ningún cliente autorizado.",
+                "mensaje": (
+                    "El RUT del pagador no está asociado "
+                    "a ningún cliente autorizado."
+                ),
                 "tipo_revision": "MANUAL",
                 "propuestas": [],
             }
@@ -1813,8 +1818,14 @@ def proponer_conciliaciones(pago_id: int):
 
             # Buscamos combinaciones de hasta 4 documentos.
             # La fecha NO es un filtro excluyente.
-            limite_combinaciones = min(len(documentos), 20)
-            documentos_para_busqueda = documentos[:limite_combinaciones]
+            limite_combinaciones = min(
+                len(documentos),
+                20,
+            )
+
+            documentos_para_busqueda = documentos[
+                :limite_combinaciones
+            ]
 
             candidatos = []
 
@@ -1831,7 +1842,10 @@ def proponer_conciliaciones(pago_id: int):
                         for documento in grupo
                     )
 
-                    diferencia = total - Decimal(pago.monto_pago)
+                    diferencia = (
+                        total
+                        - Decimal(pago.monto_pago)
+                    )
 
                     candidatos.append(
                         {
@@ -1842,7 +1856,6 @@ def proponer_conciliaciones(pago_id: int):
                         }
                     )
 
-            # Primero las coincidencias exactas.
             candidatos.sort(
                 key=lambda candidato: (
                     abs(candidato["diferencia"]),
@@ -1850,18 +1863,43 @@ def proponer_conciliaciones(pago_id: int):
                 )
             )
 
+            # Contamos cuántas combinaciones exactas existen.
+            cantidad_exactas = sum(
+                1
+                for candidato in candidatos
+                if candidato["diferencia"] == 0
+            )
+
             for candidato in candidatos[:10]:
                 diferencia = candidato["diferencia"]
 
                 if diferencia == 0:
-                    nivel = "ALTA"
-                    motivo = "Coincidencia exacta de monto."
+                    if cantidad_exactas == 1:
+                        nivel = "ALTA"
+                        motivo = (
+                            "Coincidencia exacta de monto."
+                        )
+                    else:
+                        nivel = "ALTA_AMBIGUA"
+                        motivo = (
+                            f"Coincidencia exacta de monto, "
+                            f"pero existen {cantidad_exactas} "
+                            "combinaciones exactas posibles. "
+                            "Requiere revisión manual."
+                        )
+
                 elif abs(diferencia) <= Decimal("1000"):
                     nivel = "MEDIA"
-                    motivo = "Monto muy cercano; requiere revisión."
+                    motivo = (
+                        "Monto muy cercano; requiere revisión."
+                    )
+
                 else:
                     nivel = "BAJA"
-                    motivo = "Existe diferencia de monto; requiere revisión."
+                    motivo = (
+                        "Existe diferencia de monto; "
+                        "requiere revisión."
+                    )
 
                 propuestas.append(
                     {
@@ -1871,7 +1909,9 @@ def proponer_conciliaciones(pago_id: int):
                         "nivel": nivel,
                         "motivo": motivo,
                         "monto_pago": pago.monto_pago,
-                        "total_documentos": candidato["total_aplicado"],
+                        "total_documentos": candidato[
+                            "total_aplicado"
+                        ],
                         "diferencia": diferencia,
                         "documentos": [
                             {
@@ -1881,7 +1921,9 @@ def proponer_conciliaciones(pago_id: int):
                                 "monto_total": documento.monto_total,
                                 "saldo_pendiente": documento.saldo_pendiente,
                             }
-                            for documento in candidato["documentos"]
+                            for documento in candidato[
+                                "documentos"
+                            ]
                         ],
                     }
                 )
