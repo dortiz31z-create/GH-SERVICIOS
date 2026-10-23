@@ -30,7 +30,7 @@ import pandas as pd
 from app.database import SessionLocal
 
 from app.models.cliente import Cliente
-
+from app.models.credito_cliente import CreditoCliente
 from app.models.documento_tributario import DocumentoTributario
 
 from app.models.importacion_sii import ImportacionSII
@@ -2910,47 +2910,261 @@ def listar_evaluaciones_credito(
                     f"{str(e)}"
                 ),
             )            
-@app.get(
-    "/api/evaluaciones-credito/{evaluacion_id}/documentos",
-    response_model=list[DocumentoCreditoRespuesta],
+@app.post(
+    "/api/evaluaciones-credito/{evaluacion_id}/decision",
+    response_model=EvaluacionCreditoRespuesta,
 )
-def listar_documentos_credito(evaluacion_id: int):
-    """Lista los documentos asociados a una evaluación de crédito."""
+def decidir_evaluacion_credito(
+    evaluacion_id: int,
+    datos: DecisionCredito,
+):
+    """Registra la decisión de Gerencia sobre una evaluación de crédito."""
+
+    RESULTADOS_PERMITIDOS = {
+        "APROBADO",
+        "APROBADO_CONDICIONES",
+        "RECHAZADO",
+        "PENDIENTE",
+    }
+
+    resultado = datos.resultado.strip().upper()
+
+    if resultado not in RESULTADOS_PERMITIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Resultado de decisión no permitido. "
+                "Resultados válidos: "
+                + ", ".join(sorted(RESULTADOS_PERMITIDOS))
+            ),
+        )
 
     with SessionLocal() as db:
-        try:
-            evaluacion = db.get(EvaluacionCredito, evaluacion_id)
+        evaluacion = db.get(EvaluacionCredito, evaluacion_id)
 
-            if evaluacion is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail="La evaluación de crédito no existe.",
-                )
-
-            stmt = (
-                select(DocumentoCredito)
-                .where(
-                    DocumentoCredito.evaluacion_credito_id == evaluacion_id
-                )
-                .order_by(DocumentoCredito.id.asc())
-            )
-
-            documentos = db.scalars(stmt).all()
-
-            return documentos
-
-        except HTTPException:
-            raise
-
-        except Exception as e:
+        if evaluacion is None:
             raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Ocurrió un error al listar los documentos de crédito: "
-                    f"{str(e)}"
-                ),
+                status_code=404,
+                detail="La evaluación de crédito no existe.",
             )
 
+        # --------------------------------------------------------
+        # VOLVER A PENDIENTE
+        # --------------------------------------------------------
+
+        if resultado == "PENDIENTE":
+            evaluacion.resultado = "PENDIENTE"
+            evaluacion.estado = "PENDIENTE"
+            evaluacion.monto_aprobado = None
+            evaluacion.dias_credito_aprobados = None
+            evaluacion.fecha_decision = None
+            evaluacion.usuario_decision_id = None
+            evaluacion.observaciones = datos.observaciones
+
+            db.commit()
+            db.refresh(evaluacion)
+
+            return evaluacion
+
+        # --------------------------------------------------------
+        # VALIDACIONES PARA APROBACIONES
+        # --------------------------------------------------------
+
+        if resultado in {"APROBADO", "APROBADO_CONDICIONES"}:
+
+            if datos.monto_aprobado is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Debe indicar el monto aprobado.",
+                )
+
+            if datos.monto_aprobado <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El monto aprobado debe ser mayor que cero.",
+                )
+
+            if datos.dias_credito_aprobados is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Debe indicar los días de crédito aprobados.",
+                )
+
+            if datos.dias_credito_aprobados < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Los días de crédito aprobados "
+                        "no pueden ser negativos."
+                    ),
+                )
+
+            # La trayectoria comercial debe estar validada.
+            if not evaluacion.trayectoria_cumplida:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No se puede aprobar el crédito porque "
+                        "la trayectoria comercial todavía no está validada."
+                    ),
+                )
+
+            # ----------------------------------------------------
+            # DOCUMENTACIÓN OBLIGATORIA
+            # ----------------------------------------------------
+
+            TIPOS_DOCUMENTOS_REQUERIDOS = [
+                "ESCRITURA_CONSTITUCION",
+                "CEDULA_DUENOS",
+                "DICOM",
+                "CERTIFICADO_NO_DEUDA_TGR",
+                "CARPETA_TRIBUTARIA_SII",
+            ]
+
+            documentos = (
+                db.execute(
+                    select(DocumentoCredito)
+                    .where(
+                        DocumentoCredito.evaluacion_credito_id
+                        == evaluacion_id
+                    )
+                    .order_by(DocumentoCredito.id.desc())
+                )
+                .scalars()
+                .all()
+            )
+
+            documentos_por_tipo = {}
+
+            for documento in documentos:
+                if documento.tipo_documento not in documentos_por_tipo:
+                    documentos_por_tipo[documento.tipo_documento] = documento
+
+            faltantes = [
+                tipo
+                for tipo in TIPOS_DOCUMENTOS_REQUERIDOS
+                if tipo not in documentos_por_tipo
+            ]
+
+            if faltantes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No se puede aprobar el crédito porque faltan "
+                        "documentos obligatorios: "
+                        + ", ".join(faltantes)
+                    ),
+                )
+
+            no_aprobados = [
+                documento.tipo_documento
+                for documento in documentos_por_tipo.values()
+                if (
+                    documento.tipo_documento
+                    in TIPOS_DOCUMENTOS_REQUERIDOS
+                    and documento.estado_revision != "APROBADO"
+                )
+            ]
+
+            if no_aprobados:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No se puede aprobar el crédito porque existen "
+                        "documentos obligatorios que no están aprobados: "
+                        + ", ".join(no_aprobados)
+                    ),
+                )
+
+        # --------------------------------------------------------
+        # REGISTRAR DECISIÓN
+        # --------------------------------------------------------
+
+        evaluacion.resultado = resultado
+        evaluacion.estado = resultado
+
+        if resultado == "RECHAZADO":
+            evaluacion.monto_aprobado = None
+            evaluacion.dias_credito_aprobados = None
+
+        else:
+            evaluacion.monto_aprobado = datos.monto_aprobado
+            evaluacion.dias_credito_aprobados = (
+                datos.dias_credito_aprobados
+            )
+
+        evaluacion.fecha_decision = date.today()
+        evaluacion.observaciones = datos.observaciones
+
+        # --------------------------------------------------------
+        # CREAR / ACTUALIZAR CRÉDITO VIGENTE
+        # --------------------------------------------------------
+        #
+        # Solo APROBADO genera crédito operativo.
+        #
+        # APROBADO_CONDICIONES queda registrado como decisión,
+        # pero todavía no activa automáticamente el crédito.
+        #
+
+        if resultado == "APROBADO":
+
+            credito = (
+                db.execute(
+                    select(CreditoCliente)
+                    .where(
+                        CreditoCliente.cliente_id
+                        == evaluacion.cliente_id,
+                        CreditoCliente.activo.is_(True),
+                    )
+                    .order_by(CreditoCliente.id.desc())
+                )
+                .scalars()
+                .first()
+            )
+
+            if credito is None:
+                credito = CreditoCliente(
+                    cliente_id=evaluacion.cliente_id,
+                    dias_credito=evaluacion.dias_credito_aprobados,
+                    limite_credito=evaluacion.monto_aprobado,
+                    fecha_inicio=date.today(),
+                    fecha_revision=None,
+                    activo=True,
+                    observaciones=(
+                        f"Crédito aprobado mediante evaluación "
+                        f"#{evaluacion.id}."
+                    ),
+                )
+
+                db.add(credito)
+
+            else:
+                credito.dias_credito = (
+                    evaluacion.dias_credito_aprobados
+                )
+                credito.limite_credito = (
+                    evaluacion.monto_aprobado
+                )
+                credito.fecha_inicio = date.today()
+                credito.activo = True
+                credito.observaciones = (
+                    f"Crédito actualizado mediante evaluación "
+                    f"#{evaluacion.id}."
+                )
+
+        # --------------------------------------------------------
+        # RECHAZADO
+        # --------------------------------------------------------
+        #
+        # Una evaluación rechazada no crea un crédito.
+        # Tampoco modificamos automáticamente un crédito anterior,
+        # porque eso requiere una decisión de negocio explícita.
+        #
+
+        db.commit()
+        db.refresh(evaluacion)
+
+        return evaluacion
 @app.post(
     "/api/evaluaciones-credito/{evaluacion_id}/documentos",
     response_model=DocumentoCreditoRespuesta,
