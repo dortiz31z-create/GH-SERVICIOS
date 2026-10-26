@@ -23,6 +23,9 @@ from app.models.credito_cliente import CreditoCliente
 from app.models.historial_credito import HistorialCredito
 from app.models.evaluacion_credito import EvaluacionCredito
 from app.models.documento_credito import DocumentoCredito
+from app.models.revision_conciliacion import RevisionConciliacion
+from app.models.detalle_revision_conciliacion import DetalleRevisionConciliacion
+
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
