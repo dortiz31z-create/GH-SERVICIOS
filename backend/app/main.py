@@ -36,6 +36,9 @@ from app.models.documento_tributario import DocumentoTributario
 from app.models.importacion_sii import ImportacionSII
 
 from app.models.pago import Pago
+from app.models.aplicacion_pago import AplicacionPago
+from app.models.revision_conciliacion import RevisionConciliacion
+from app.models.detalle_revision_conciliacion import DetalleRevisionConciliacion
 
 from app.models.movimiento_bancario import MovimientoBancario
 
@@ -71,17 +74,16 @@ app = FastAPI(
 
 
 app.add_middleware(
-
     CORSMiddleware,
-
-    allow_origins=["http://localhost:5173"],
-
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
     allow_credentials=True,
-
     allow_methods=["*"],
-
     allow_headers=["*"],
-
 )
 
 
@@ -1747,7 +1749,41 @@ def crear_pagos_desde_abonos():
             "pagos_creados": creados,
             "pagos_ya_existentes": ya_existentes,
         }
+@app.get("/api/pagos")
+def listar_pagos():
+    with SessionLocal() as db:
+        pagos = db.scalars(
+            select(Pago).order_by(
+                Pago.fecha_pago.desc(),
+                Pago.id.desc(),
+            )
+        ).all()
 
+        resultado = []
+
+        for pago in pagos:
+            movimiento = db.get(
+                MovimientoBancario,
+                pago.movimiento_bancario_id,
+            )
+
+            resultado.append({
+                "pago_id": pago.id,
+                "fecha_pago": pago.fecha_pago.isoformat()
+                if pago.fecha_pago else None,
+                "monto_pago": float(pago.monto_pago),
+                "estado": pago.estado,
+                "cliente_id": pago.cliente_id,
+                "movimiento_bancario_id": pago.movimiento_bancario_id,
+                "descripcion": movimiento.descripcion_original
+                if movimiento else None,
+                "rut_pagador_detectado": movimiento.rut_pagador_detectado
+                if movimiento else None,
+                "nombre_pagador_detectado": movimiento.nombre_pagador_detectado
+                if movimiento else None,
+            })
+
+        return resultado
 @app.get("/api/pagos/{pago_id}/propuestas-conciliacion")
 def propuestas_conciliacion(pago_id: int):
     with SessionLocal() as db:
@@ -1793,22 +1829,28 @@ def propuestas_conciliacion(pago_id: int):
         # También buscamos clientes cuyo RUT corresponda
         # directamente al RUT del pagador detectado.
         if movimiento.rut_pagador_detectado:
-            cliente_por_rut = db.scalar(
-                select(Cliente)
-                .where(
-                    Cliente.rut == movimiento.rut_pagador_detectado
-                )
-                .limit(1)
+            rut_detectado = normalizar_rut(
+                movimiento.rut_pagador_detectado
             )
+            clientes_encontrados = db.scalars(
+                select(Cliente)
+            ).all()
 
-            if cliente_por_rut:
-                if cliente_por_rut.id not in clientes_candidatos:
-                    clientes_candidatos.append(cliente_por_rut.id)
+            for cliente in clientes_encontrados:
+                if normalizar_rut(cliente.rut) == rut_detectado:
+                    if cliente.id not in clientes_candidatos:
+                        clientes_candidatos.append(cliente.id)
 
         # ---------------------------------------------------------
-        # 2. Identificar clientes por texto de la descripción bancaria
         # ---------------------------------------------------------
-        if movimiento.descripcion_original:
+        # 2. Identificar clientes por texto bancario solo si no hay
+        #    un RUT detectado que no coincide con ning?n cliente.
+        # ---------------------------------------------------------
+        rut_detectado = normalizar_rut(
+            movimiento.rut_pagador_detectado
+        )
+
+        if movimiento.descripcion_original and not rut_detectado:
             descripcion = movimiento.descripcion_original.strip()
 
             palabras = [
@@ -1835,7 +1877,6 @@ def propuestas_conciliacion(pago_id: int):
                 if cliente_id not in clientes_candidatos:
                     clientes_candidatos.append(cliente_id)
 
-        # ---------------------------------------------------------
         # 3. Obtener documentos candidatos
         # ---------------------------------------------------------
         documentos = []
@@ -1868,10 +1909,11 @@ def propuestas_conciliacion(pago_id: int):
                 ).all()
 
         # ---------------------------------------------------------
-        # 4. Si no conocemos al cliente, buscar candidatos
-        #    por monto y fecha.
         # ---------------------------------------------------------
-        if not documentos:
+        # 4. No buscar facturas de otros clientes por monto y fecha
+        #    cuando el pagador no est? identificado.
+        # ---------------------------------------------------------
+        if not documentos and not rut_detectado:
             documentos = db.scalars(
                 select(DocumentoTributario)
                 .where(
@@ -1886,26 +1928,43 @@ def propuestas_conciliacion(pago_id: int):
             ).all()
 
         # ---------------------------------------------------------
+
+
+
+        # ---------------------------------------------------------
+        # 4.1. Si el banco detect? un RUT, exigir coincidencia exacta.
+        # Nunca proponer documentos de otro contribuyente.
+        if rut_detectado:
+            documentos = [
+                doc
+                for doc in documentos
+                if normalizar_rut(doc.rut_cliente) == rut_detectado
+            ]
+
         # 5. Evaluar documentos individuales y combinaciones
         # ---------------------------------------------------------
         propuestas = []
 
-        def agregar_propuesta(
-            docs,
-            total,
-            tipo,
-        ):
+        # Cargar clientes una sola vez para evitar consultas
+        # repetidas a la base de datos por cada propuesta.
+        clientes_por_rut = {
+            normalizar_rut(cliente.rut): cliente
+            for cliente in db.scalars(select(Cliente)).all()
+            if normalizar_rut(cliente.rut)
+        }
+
+        limite_inferior = max(
+            Decimal("0"),
+            monto_pago - Decimal("5000"),
+        )
+        limite_superior = monto_pago + Decimal("5000")
+
+        def agregar_propuesta(docs, total, tipo):
             diferencia = total - monto_pago
             diferencia_abs = abs(diferencia)
 
             if diferencia_abs > Decimal("5000"):
                 return
-
-            fechas = [
-                doc.fecha_documento
-                for doc in docs
-                if doc.fecha_documento
-            ]
 
             documentos_futuros = [
                 doc
@@ -1938,22 +1997,16 @@ def propuestas_conciliacion(pago_id: int):
                 "documentos_futuros": len(documentos_futuros),
             }
 
-            # Determinar cliente si todos los documentos
-            # pertenecen al mismo RUT.
+            # Identificar al cliente usando el RUT normalizado.
             ruts = {
-                doc.rut_cliente
+                normalizar_rut(doc.rut_cliente)
                 for doc in docs
-                if doc.rut_cliente
+                if normalizar_rut(doc.rut_cliente)
             }
 
             if len(ruts) == 1:
-                rut_cliente = next(iter(ruts))
-
-                cliente = db.scalar(
-                    select(Cliente)
-                    .where(Cliente.rut == rut_cliente)
-                    .limit(1)
-                )
+                rut_normalizado = next(iter(ruts))
+                cliente = clientes_por_rut.get(rut_normalizado)
 
                 if cliente:
                     propuesta["cliente_id"] = cliente.id
@@ -1962,42 +2015,121 @@ def propuestas_conciliacion(pago_id: int):
 
             propuestas.append(propuesta)
 
-        # ---------------------------------------------------------
-        # Individuales
-        # ---------------------------------------------------------
+        # Evaluar documentos individuales.
         for doc in documentos:
-            agregar_propuesta(
-                [doc],
-                Decimal(doc.saldo_pendiente),
-                "DOCUMENTO_UNICO",
-            )
+            saldo = Decimal(str(doc.saldo_pendiente))
 
-        # ---------------------------------------------------------
-        # Combinaciones de hasta 4 documentos
-        # ---------------------------------------------------------
-        documentos_combinables = documentos
-
-        for cantidad in range(2, 5):
-            for combo in combinations(
-                documentos_combinables,
-                cantidad,
-            ):
-                total = sum(
-                    (
-                        Decimal(doc.saldo_pendiente)
-                        for doc in combo
-                    ),
-                    Decimal("0"),
+            if limite_inferior <= saldo <= limite_superior:
+                agregar_propuesta(
+                    [doc],
+                    saldo,
+                    "DOCUMENTO_UNICO",
                 )
 
-                diferencia_abs = abs(total - monto_pago)
+        # Preparar candidatos válidos para las combinaciones.
+        # Solo se consideran saldos positivos que no superen
+        # el monto del pago más el margen permitido.
+        documentos_combinables = [
+            doc
+            for doc in documentos
+            if Decimal(str(doc.saldo_pendiente)) > 0
+            and Decimal(str(doc.saldo_pendiente)) <= limite_superior
+        ]
 
-                if diferencia_abs <= Decimal("5000"):
+        documentos_combinables.sort(
+            key=lambda doc: Decimal(str(doc.saldo_pendiente))
+        )
+
+        saldos = [
+            Decimal(str(doc.saldo_pendiente))
+            for doc in documentos_combinables
+        ]
+
+        # Combinaciones de 2, 3 y 4 documentos.
+        # Como los saldos están ordenados y son positivos,
+        # se puede abandonar una rama cuando el total excede
+        # el límite superior.
+
+        # Buscar combinaciones con un límite de trabajo para
+        # evitar que la solicitud quede ejecutándose indefinidamente.
+        nodos_visitados = 0
+        limite_nodos = 100000
+        busqueda_limitada = False
+
+        def buscar_combinaciones(inicio, cantidad_restante, total, seleccion):
+            nonlocal nodos_visitados, busqueda_limitada
+
+            if nodos_visitados >= limite_nodos:
+                busqueda_limitada = True
+                return
+
+            nodos_visitados += 1
+
+            if cantidad_restante == 0:
+                if limite_inferior <= total <= limite_superior:
                     agregar_propuesta(
-                        combo,
+                        seleccion,
                         total,
-                        f"COMBINACION_{cantidad}",
+                        f"COMBINACION_{len(seleccion)}",
                     )
+                return
+
+            ultimo_inicio = len(documentos_combinables) - cantidad_restante
+
+            for indice in range(inicio, ultimo_inicio + 1):
+                if nodos_visitados >= limite_nodos:
+                    busqueda_limitada = True
+                    return
+                if seleccion:
+                    rut_base = normalizar_rut(
+                        seleccion[0].rut_cliente
+                    )
+                    rut_actual = normalizar_rut(
+                        documentos_combinables[indice].rut_cliente
+                    )
+
+                    if not rut_base or not rut_actual or rut_base != rut_actual:
+                        continue
+
+                nuevo_total = total + saldos[indice]
+
+                if nuevo_total > limite_superior:
+                    break
+
+                indices_faltantes = cantidad_restante - 1
+                minimo_posible = nuevo_total
+
+                for siguiente in range(
+                    indice + 1,
+                    indice + 1 + indices_faltantes,
+                ):
+                    minimo_posible += saldos[siguiente]
+
+                if minimo_posible > limite_superior:
+                    continue
+
+                buscar_combinaciones(
+                    indice + 1,
+                    cantidad_restante - 1,
+                    nuevo_total,
+                    seleccion + [documentos_combinables[indice]],
+                )
+
+                if busqueda_limitada:
+                    return
+
+        for cantidad in range(2, 5):
+            if len(documentos_combinables) >= cantidad:
+                buscar_combinaciones(
+                    0,
+                    cantidad,
+                    Decimal("0"),
+                    [],
+                )
+
+            if busqueda_limitada:
+                break
+
 
         # ---------------------------------------------------------
         # 6. Ordenar propuestas
@@ -2060,6 +2192,221 @@ def propuestas_conciliacion(pago_id: int):
             "descripcion_original": movimiento.descripcion_original,
             "propuestas": propuestas,
         }
+
+class DocumentoAceptacion(BaseModel):
+    documento_id: int
+    monto_aplicado: Decimal
+
+
+class AceptarPropuestaRequest(BaseModel):
+    documentos: list[DocumentoAceptacion]
+    cliente_id: int | None = None
+    observaciones: str | None = None
+
+
+@app.post("/api/pagos/{pago_id}/aceptar-propuesta")
+def aceptar_propuesta_conciliacion(
+    pago_id: int,
+    datos: AceptarPropuestaRequest,
+):
+    from datetime import datetime
+    from sqlalchemy import select
+
+    if not datos.documentos:
+        raise HTTPException(
+            status_code=400,
+            detail="Debes seleccionar al menos un documento.",
+        )
+
+    ids = [d.documento_id for d in datos.documentos]
+
+    if len(ids) != len(set(ids)):
+        raise HTTPException(
+            status_code=400,
+            detail="La propuesta contiene documentos duplicados.",
+        )
+
+    if any(d.monto_aplicado <= 0 for d in datos.documentos):
+        raise HTTPException(
+            status_code=400,
+            detail="Los montos aplicados deben ser mayores que cero.",
+        )
+
+    total_aplicado = sum(
+        (d.monto_aplicado for d in datos.documentos),
+        Decimal("0.00"),
+    )
+
+    with SessionLocal() as db:
+        try:
+            pago = db.scalar(
+                select(Pago)
+                .where(Pago.id == pago_id)
+                .with_for_update()
+            )
+
+            if not pago:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Pago no encontrado.",
+                )
+
+            if pago.estado == "conciliado":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Este pago ya está conciliado.",
+                )
+
+            aplicaciones_existentes = db.scalar(
+                select(func.count())
+                .select_from(AplicacionPago)
+                .where(AplicacionPago.pago_id == pago_id)
+            )
+
+            if aplicaciones_existentes:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Este pago ya tiene aplicaciones registradas.",
+                )
+
+            if total_aplicado != Decimal(str(pago.monto_pago)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "El total de los documentos debe coincidir "
+                        "exactamente con el monto del pago. "
+                        "No se aplicó ningún saldo."
+                    ),
+                )
+
+            documentos_db = db.scalars(
+                select(DocumentoTributario)
+                .where(DocumentoTributario.id.in_(ids))
+                .with_for_update()
+            ).all()
+
+            if len(documentos_db) != len(ids):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Uno o más documentos no existen.",
+                )
+
+            documentos_por_id = {
+                doc.id: doc for doc in documentos_db
+            }
+
+            ruts = {doc.rut_cliente for doc in documentos_db}
+
+            if len(ruts) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Los documentos pertenecen a distintos clientes. "
+                        "No se aplicó ningún saldo."
+                    ),
+                )
+
+            rut_documentos = next(iter(ruts))
+
+            if datos.cliente_id is not None:
+                cliente = db.get(Cliente, datos.cliente_id)
+
+                if not cliente or cliente.rut != rut_documentos:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "El cliente seleccionado no coincide "
+                            "con el RUT de las facturas."
+                        ),
+                    )
+            else:
+                cliente = db.scalar(
+                    select(Cliente)
+                    .where(Cliente.rut == rut_documentos)
+                    .limit(1)
+                )
+
+            for item in datos.documentos:
+                doc = documentos_por_id[item.documento_id]
+                monto = Decimal(str(item.monto_aplicado))
+                saldo = Decimal(str(doc.saldo_pendiente))
+
+                if monto > saldo:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"El monto solicitado supera el saldo "
+                            f"pendiente del documento folio {doc.folio}."
+                        ),
+                    )
+
+            fecha_revision = datetime.utcnow()
+
+            revision = RevisionConciliacion(
+                pago_id=pago.id,
+                estado="ACEPTADA",
+                cliente_propuesto_id=datos.cliente_id,
+                cliente_confirmado_id=cliente.id if cliente else None,
+                fecha_revision=fecha_revision,
+                observaciones=datos.observaciones,
+                evidencia_propuesta=(
+                    f"Documentos aceptados: {', '.join(map(str, ids))}"
+                ),
+            )
+            db.add(revision)
+            db.flush()
+
+            for item in datos.documentos:
+                doc = documentos_por_id[item.documento_id]
+                monto = Decimal(str(item.monto_aplicado))
+
+                db.add(
+                    DetalleRevisionConciliacion(
+                        revision_id=revision.id,
+                        documento_id=doc.id,
+                        monto_propuesto=monto,
+                        observaciones=datos.observaciones,
+                    )
+                )
+
+                db.add(
+                    AplicacionPago(
+                        pago_id=pago.id,
+                        documento_id=doc.id,
+                        monto_aplicado=monto,
+                        fecha_aplicacion=pago.fecha_pago,
+                        observaciones=datos.observaciones,
+                    )
+                )
+
+                nuevo_saldo = (
+                    Decimal(str(doc.saldo_pendiente)) - monto
+                )
+                doc.saldo_pendiente = nuevo_saldo
+
+                if nuevo_saldo == 0:
+                    doc.estado_pago = "PAGADO"
+                else:
+                    doc.estado_pago = "PARCIAL"
+
+            pago.estado = "conciliado"
+            if cliente:
+                pago.cliente_id = cliente.id
+
+            db.commit()
+
+            return {
+                "mensaje": "Propuesta aceptada y conciliación registrada.",
+                "pago_id": pago.id,
+                "revision_id": revision.id,
+                "cliente_id": cliente.id if cliente else None,
+                "total_aplicado": float(total_aplicado),
+                "documentos_actualizados": len(documentos_db),
+            }
+
+        except Exception:
+            db.rollback()
+            raise
 
 @app.post("/api/pagos/actualizar-identificacion")
 def actualizar_identificacion_pagos():
@@ -2472,7 +2819,7 @@ def candidatos_por_rut_pagador(rut_pagador: str):
             "rut_pagador": rut_pagador,
             "pagos": resultado,
         }
-       
+
 @app.post("/api/movimientos-bancarios/importar-santander")
 
 async def importar_cartola_santander(
@@ -3395,7 +3742,7 @@ def listar_evaluaciones_credito(
                     "Ocurrió un error al listar las evaluaciones de crédito: "
                     f"{str(e)}"
                 ),
-            )            
+            )
 @app.post(
     "/api/evaluaciones-credito/{evaluacion_id}/decision",
     response_model=EvaluacionCreditoRespuesta,
@@ -3837,7 +4184,7 @@ async def subir_documento_credito(
                     "de crédito: "
                     f"{str(e)}"
                 ),
-            )            
+            )
 @app.get(
     "/api/evaluaciones-credito/{evaluacion_id}/documentacion",
     response_model=DocumentacionCreditoRespuesta,
@@ -3915,7 +4262,7 @@ def obtener_documentacion_credito(evaluacion_id: int):
             "documentos_faltantes": documentos_faltantes,
             "documentacion_completa": documentos_faltantes == 0,
             "estados": estados,
-        }     
+        }
 class RevisarDocumentoCredito(BaseModel):
     estado_revision: str
     observaciones: str | None = None
@@ -3988,9 +4335,9 @@ def revisar_documento_credito(
         db.commit()
         db.refresh(documento)
 
-        return documento     
+        return documento
 
-      
+
 
 
 @app.post(
@@ -4166,7 +4513,7 @@ def decidir_evaluacion_credito(
         db.commit()
         db.refresh(evaluacion)
 
-        return evaluacion          
+        return evaluacion
 
 @app.patch(
     "/api/evaluaciones-credito/{evaluacion_id}/trayectoria",
@@ -4244,7 +4591,7 @@ def validar_trayectoria_credito(
         db.commit()
         db.refresh(evaluacion)
 
-        return evaluacion        
+        return evaluacion
 
 
-        
+

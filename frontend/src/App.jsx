@@ -4,6 +4,8 @@ import DocumentosView from './components/DocumentosView'
 
 import EvaluacionesCredito from './components/EvaluacionesCredito'
 
+import ConciliacionView from './components/ConciliacionView'
+
 
 const API_URL = 'http://localhost:8000'
 
@@ -450,17 +452,7 @@ function App() {
         )}
 
 
-        {vista === 'conciliacion' && (
-
-          <ModuloProximamente
-
-            titulo="Conciliación"
-
-            descripcion="Aquí construiremos el proceso de conciliación entre pagos, movimientos bancarios y documentos SII."
-
-          />
-
-        )}
+{vista === 'conciliacion' && <ConciliacionView />}
 
         {/* CRÉDITO */}
         {vista === 'credito' && (
