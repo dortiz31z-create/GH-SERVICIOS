@@ -2308,6 +2308,32 @@ def aceptar_propuesta_conciliacion(
 
             rut_documentos = next(iter(ruts))
 
+            # Seguridad: el RUT bancario detectado debe coincidir
+            # con el RUT de los documentos antes de conciliarlos.
+            movimiento = db.get(
+                MovimientoBancario,
+                pago.movimiento_bancario_id,
+            )
+            rut_pagador = normalizar_rut(
+                movimiento.rut_pagador_detectado
+            ) if movimiento else None
+            rut_cliente_documentos = normalizar_rut(rut_documentos)
+
+            if (
+                rut_pagador
+                and rut_cliente_documentos
+                and rut_pagador != rut_cliente_documentos
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Conciliaci?n bloqueada: el RUT detectado "
+                        "en la cartola no coincide con el RUT "
+                        "de los documentos. Verifica la identidad "
+                        "del pagador antes de continuar."
+                    ),
+                )
+
             if datos.cliente_id is not None:
                 cliente = db.get(Cliente, datos.cliente_id)
 

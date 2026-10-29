@@ -1,0 +1,4580 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+
+from fastapi.middleware.cors import CORSMiddleware
+
+from pydantic import BaseModel
+
+from sqlalchemy import func, select
+
+
+
+import hashlib
+
+import io
+
+import re
+
+from pathlib import Path
+
+from decimal import Decimal, InvalidOperation
+
+from itertools import combinations
+from datetime import date, datetime
+
+
+
+import pandas as pd
+
+
+
+from app.database import SessionLocal
+
+from app.models.cliente import Cliente
+from app.models.credito_cliente import CreditoCliente
+from app.models.documento_tributario import DocumentoTributario
+
+from app.models.importacion_sii import ImportacionSII
+
+from app.models.pago import Pago
+from app.models.aplicacion_pago import AplicacionPago
+from app.models.revision_conciliacion import RevisionConciliacion
+from app.models.detalle_revision_conciliacion import DetalleRevisionConciliacion
+
+from app.models.movimiento_bancario import MovimientoBancario
+
+from app.models.importacion_bancaria import ImportacionBancaria
+
+from app.models.cuenta_bancaria_gh import CuentaBancariaGH
+from app.models.pagador import Pagador
+from app.models.evaluacion_credito import EvaluacionCredito
+from app.models.documento_credito import DocumentoCredito
+from app.schemas.evaluacion_credito import (
+    EvaluacionCreditoCrear,
+    EvaluacionCreditoRespuesta,
+)
+from app.models.usuario import Usuario
+from app.schemas.documento_credito import DocumentoCreditoRespuesta
+from app.schemas.documentacion_credito import DocumentacionCreditoRespuesta
+from app.schemas.decision_credito import DecisionCredito
+from app.schemas.trayectoria_credito import ValidacionTrayectoriaCredito
+
+
+app = FastAPI(
+
+    title="GH Servicios",
+
+    description="Sistema de gestión de clientes, facturas, pagos y conciliación",
+
+    version="0.1.0",
+
+)
+
+
+
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+
+
+
+# ============================================================
+
+# FUNCIONES GENERALES
+
+# ============================================================
+
+
+
+@app.get("/")
+
+def root():
+
+    return {
+
+        "message": "GH Servicios API funcionando",
+
+        "version": "0.1.0",
+
+    }
+
+
+
+
+
+@app.get("/api/dashboard")
+
+def dashboard():
+
+    with SessionLocal() as db:
+
+        clientes = db.scalar(
+
+            select(func.count()).select_from(Cliente)
+
+        )
+
+
+
+        documentos = db.scalar(
+
+            select(func.count()).select_from(DocumentoTributario)
+
+        )
+
+
+
+        pagos_pendientes = db.scalar(
+
+            select(func.count())
+
+            .select_from(Pago)
+
+            .where(Pago.estado == "pendiente")
+
+        )
+
+
+
+        movimientos = db.scalar(
+
+            select(func.count()).select_from(MovimientoBancario)
+
+        )
+
+
+
+        return {
+
+            "clientes": clientes,
+
+            "documentos": documentos,
+
+            "pagos_pendientes": pagos_pendientes,
+
+            "movimientos": movimientos,
+
+        }
+
+
+
+
+
+# ============================================================
+
+# CLIENTES
+
+# ============================================================
+
+
+
+class ClienteCreate(BaseModel):
+
+    rut: str
+
+    razon_social: str
+
+    nombre_fantasia: str | None = None
+
+    giro: str | None = None
+
+    direccion: str | None = None
+
+    comuna: str | None = None
+
+    ciudad: str | None = None
+
+    telefono: str | None = None
+
+    email: str | None = None
+
+class PagadorCreate(BaseModel):
+    cliente_id: int
+    rut_pagador: str
+    nombre_pagador: str
+    tipo: str = "empresa"
+    autorizado: bool = True
+    fecha_desde: date | None = None
+    fecha_hasta: date | None = None
+    observaciones: str | None = None
+
+
+@app.get("/api/pagadores")
+def listar_pagadores():
+    with SessionLocal() as db:
+        pagadores = db.scalars(
+            select(Pagador).order_by(Pagador.nombre_pagador)
+        ).all()
+
+        return [
+            {
+                "id": pagador.id,
+                "cliente_id": pagador.cliente_id,
+                "rut_pagador": pagador.rut_pagador,
+                "nombre_pagador": pagador.nombre_pagador,
+                "tipo": pagador.tipo,
+                "autorizado": pagador.autorizado,
+                "fecha_desde": pagador.fecha_desde,
+                "fecha_hasta": pagador.fecha_hasta,
+                "observaciones": pagador.observaciones,
+            }
+            for pagador in pagadores
+        ]
+
+
+@app.post("/api/pagadores")
+def crear_pagador(datos: PagadorCreate):
+    with SessionLocal() as db:
+        cliente = db.get(Cliente, datos.cliente_id)
+
+        if not cliente:
+            raise HTTPException(
+                status_code=404,
+                detail="El cliente indicado no existe.",
+            )
+
+        pagador_existente = db.scalar(
+            select(Pagador).where(
+                Pagador.cliente_id == datos.cliente_id,
+                Pagador.rut_pagador == datos.rut_pagador,
+            )
+        )
+
+        if pagador_existente:
+            raise HTTPException(
+                status_code=400,
+                detail="Ese RUT ya está registrado como pagador de este cliente.",
+            )
+
+        pagador = Pagador(
+            cliente_id=datos.cliente_id,
+            rut_pagador=datos.rut_pagador,
+            nombre_pagador=datos.nombre_pagador,
+            tipo=datos.tipo,
+            autorizado=datos.autorizado,
+            fecha_desde=datos.fecha_desde,
+            fecha_hasta=datos.fecha_hasta,
+            observaciones=datos.observaciones,
+        )
+
+        db.add(pagador)
+        db.commit()
+        db.refresh(pagador)
+
+        return {
+            "mensaje": "Pagador registrado correctamente.",
+            "pagador": {
+                "id": pagador.id,
+                "cliente_id": pagador.cliente_id,
+                "rut_pagador": pagador.rut_pagador,
+                "nombre_pagador": pagador.nombre_pagador,
+                "tipo": pagador.tipo,
+                "autorizado": pagador.autorizado,
+                "fecha_desde": pagador.fecha_desde,
+                "fecha_hasta": pagador.fecha_hasta,
+                "observaciones": pagador.observaciones,
+            },
+        }
+
+
+
+@app.get("/api/clientes")
+
+def listar_clientes():
+
+    with SessionLocal() as db:
+
+        clientes = db.scalars(
+
+            select(Cliente).order_by(Cliente.razon_social)
+
+        ).all()
+
+
+
+        return [
+
+            {
+
+                "id": cliente.id,
+
+                "rut": cliente.rut,
+
+                "razon_social": cliente.razon_social,
+
+                "nombre_fantasia": cliente.nombre_fantasia,
+
+                "giro": cliente.giro,
+
+                "direccion": cliente.direccion,
+
+                "comuna": cliente.comuna,
+
+                "ciudad": cliente.ciudad,
+
+                "telefono": cliente.telefono,
+
+                "email": cliente.email,
+
+                "activo": cliente.activo,
+
+            }
+
+            for cliente in clientes
+
+        ]
+
+
+
+
+
+@app.post("/api/clientes")
+
+def crear_cliente(cliente_data: ClienteCreate):
+
+    with SessionLocal() as db:
+
+        cliente_existente = db.scalar(
+
+            select(Cliente).where(
+
+                Cliente.rut == cliente_data.rut
+
+            )
+
+        )
+
+
+
+        if cliente_existente:
+
+            return {
+
+                "error": "Ya existe un cliente con ese RUT"
+
+            }
+
+
+
+        cliente = Cliente(
+
+            rut=cliente_data.rut,
+
+            razon_social=cliente_data.razon_social,
+
+            nombre_fantasia=cliente_data.nombre_fantasia,
+
+            giro=cliente_data.giro,
+
+            direccion=cliente_data.direccion,
+
+            comuna=cliente_data.comuna,
+
+            ciudad=cliente_data.ciudad,
+
+            telefono=cliente_data.telefono,
+
+            email=cliente_data.email,
+
+        )
+
+
+
+        db.add(cliente)
+
+        db.commit()
+
+        db.refresh(cliente)
+
+
+
+        return {
+
+            "id": cliente.id,
+
+            "rut": cliente.rut,
+
+            "razon_social": cliente.razon_social,
+
+            "mensaje": "Cliente creado correctamente",
+
+        }
+
+
+
+
+
+# ============================================================
+
+# DOCUMENTOS TRIBUTARIOS
+
+# ============================================================
+
+
+
+@app.get("/api/documentos")
+
+def listar_documentos():
+
+    with SessionLocal() as db:
+
+        documentos = db.scalars(
+
+            select(DocumentoTributario).order_by(
+
+                DocumentoTributario.fecha_documento.desc(),
+
+                DocumentoTributario.folio.desc(),
+
+            )
+
+        ).all()
+
+
+
+        return [
+
+            {
+
+                "id": documento.id,
+
+                "importacion_sii_id": documento.importacion_sii_id,
+
+                "rut_empresa": documento.rut_empresa,
+
+                "tipo_documento": documento.tipo_documento,
+
+                "tipo_venta": documento.tipo_venta,
+
+                "rut_cliente": documento.rut_cliente,
+
+                "razon_social": documento.razon_social,
+
+                "folio": documento.folio,
+
+                "fecha_documento": documento.fecha_documento,
+
+                "fecha_recepcion": documento.fecha_recepcion,
+
+                "monto_exento": documento.monto_exento,
+
+                "monto_neto": documento.monto_neto,
+
+                "monto_iva": documento.monto_iva,
+
+                "monto_total": documento.monto_total,
+
+                "tipo_documento_referencia": (
+
+                    documento.tipo_documento_referencia
+
+                ),
+
+                "folio_documento_referencia": (
+
+                    documento.folio_documento_referencia
+
+                ),
+
+                "numero_interno": documento.numero_interno,
+
+                "codigo_sucursal": documento.codigo_sucursal,
+
+            }
+
+            for documento in documentos
+
+        ]
+
+
+
+
+
+# ============================================================
+
+# FUNCIONES DE CONVERSIÓN DEL RCV
+
+# ============================================================
+
+
+
+def normalizar_texto(valor) -> str | None:
+
+    """
+
+    Convierte un valor del CSV a texto limpio.
+
+    Devuelve None cuando viene vacío.
+
+    """
+
+    if valor is None:
+
+        return None
+
+
+
+    try:
+
+        if pd.isna(valor):
+
+            return None
+
+    except (TypeError, ValueError):
+
+        pass
+
+
+
+    texto = str(valor).strip()
+
+
+
+    if not texto:
+
+        return None
+
+
+
+    if texto.lower() in {"nan", "none"}:
+
+        return None
+
+
+
+    return texto
+
+
+
+
+
+def normalizar_rut(valor) -> str | None:
+
+    """
+
+    Normaliza un RUT chileno quitando puntos y espacios.
+
+    """
+
+    texto = normalizar_texto(valor)
+
+
+
+    if texto is None:
+
+        return None
+
+
+
+    return (
+
+        texto
+
+        .replace(".", "")
+
+        .replace(" ", "")
+
+        .upper()
+
+    )
+
+
+
+
+
+def convertir_entero(valor) -> int | None:
+
+    """
+
+    Convierte valores como:
+
+    33
+
+    33.0
+
+    '33'
+
+    '33.0'
+
+    """
+
+    texto = normalizar_texto(valor)
+
+
+
+    if texto is None:
+
+        return None
+
+
+
+    try:
+
+        return int(float(texto.replace(",", ".")))
+
+    except (ValueError, TypeError):
+
+        return None
+
+
+
+
+
+def convertir_decimal(valor) -> Decimal | None:
+
+    """
+
+    Convierte montos provenientes del RCV.
+
+    """
+
+    texto = normalizar_texto(valor)
+
+
+
+    if texto is None:
+
+        return None
+
+
+
+    try:
+
+        texto = texto.replace(".", "").replace(",", ".")
+
+        return Decimal(texto)
+
+    except (InvalidOperation, ValueError):
+
+        return None
+
+
+
+
+
+def convertir_fecha(valor):
+
+    """
+
+    Convierte fechas del RCV a datetime.date.
+
+    """
+
+    texto = normalizar_texto(valor)
+
+
+
+    if texto is None:
+
+        return None
+
+
+
+    fecha = pd.to_datetime(
+
+        texto,
+
+        dayfirst=True,
+
+        errors="coerce",
+
+    )
+
+
+
+    if pd.isna(fecha):
+
+        return None
+
+
+
+    return fecha.date()
+
+
+
+
+
+# ============================================================
+
+# IDENTIFICACIÓN DEL ARCHIVO RCV
+
+# ============================================================
+
+
+
+def extraer_rut_y_periodo_desde_nombre(
+
+    nombre_archivo: str,
+
+) -> tuple[str, str]:
+
+    """
+
+    Extrae RUT empresa y período desde nombres como:
+
+
+
+    RCV_VENTA_76372424-7_202608.csv
+
+    RCV_VENTA_76372424-7_202608 (3).csv
+
+    """
+
+
+
+    nombre = nombre_archivo.strip()
+
+
+
+    patron = re.compile(
+
+        r"RCV_VENTA_([0-9Kk.\\-]+)_([0-9]{6})",
+
+        re.IGNORECASE,
+
+    )
+
+
+
+    coincidencia = patron.search(nombre)
+
+
+
+    if not coincidencia:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail=(
+
+                "No fue posible identificar el RUT de la empresa "
+
+                "y el período desde el nombre del archivo. "
+
+                "Se esperaba un nombre similar a "
+
+                "'RCV_VENTA_76372424-7_202608.csv'."
+
+            ),
+
+        )
+
+
+
+    rut_empresa = normalizar_rut(
+
+        coincidencia.group(1)
+
+    )
+
+
+
+    periodo = coincidencia.group(2)
+
+
+
+    return rut_empresa, periodo
+
+
+
+
+
+# ============================================================
+
+# IMPORTACIÓN RCV SII
+
+# ============================================================
+
+
+
+@app.post("/api/documentos/importar-sii")
+
+async def importar_sii(
+
+    archivo: UploadFile = File(...),
+
+):
+
+    """
+
+    Importa un archivo CSV del Registro de Compras y Ventas
+
+    del SII.
+
+
+
+    El proceso:
+
+
+
+    1. Lee el archivo.
+
+    2. Calcula SHA-256.
+
+    3. Detecta si el archivo ya fue importado.
+
+    4. Obtiene RUT empresa y período.
+
+    5. Valida la estructura.
+
+    6. Registra la importación.
+
+    7. Importa documentos tributarios.
+
+    8. Detecta documentos duplicados.
+
+    9. Confirma todo mediante una transacción.
+
+    """
+
+
+
+    # --------------------------------------------------------
+
+    # VALIDAR NOMBRE
+
+    # --------------------------------------------------------
+
+
+
+    if not archivo.filename:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="No se recibió ningún archivo.",
+
+        )
+
+
+
+    if not archivo.filename.lower().endswith(".csv"):
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="El archivo debe ser un CSV.",
+
+        )
+
+
+
+    # --------------------------------------------------------
+
+    # LEER ARCHIVO
+
+    # --------------------------------------------------------
+
+
+
+    contenido = await archivo.read()
+
+
+
+    if not contenido:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="El archivo está vacío.",
+
+        )
+
+
+
+    # --------------------------------------------------------
+
+    # CALCULAR HASH SHA-256
+
+    # --------------------------------------------------------
+
+
+
+    hash_archivo = hashlib.sha256(
+
+        contenido
+
+    ).hexdigest()
+
+
+
+    # --------------------------------------------------------
+
+    # OBTENER RUT EMPRESA Y PERÍODO
+
+    # --------------------------------------------------------
+
+
+
+    rut_empresa, periodo = (
+
+        extraer_rut_y_periodo_desde_nombre(
+
+            archivo.filename
+
+        )
+
+    )
+
+
+
+    # --------------------------------------------------------
+
+    # VERIFICAR ARCHIVO YA IMPORTADO
+
+    # --------------------------------------------------------
+
+
+
+    with SessionLocal() as db:
+
+
+
+        importacion_existente = db.scalar(
+
+            select(ImportacionSII).where(
+
+                ImportacionSII.hash_archivo
+
+                == hash_archivo
+
+            )
+
+        )
+
+
+
+        if importacion_existente:
+
+
+
+            # ------------------------------------------------
+
+            # RECUPERACIÓN DEL PRIMER INTENTO FALLIDO
+
+            # ------------------------------------------------
+
+            #
+
+            # Nuestro primer intento registró la importación
+
+            # pero no pudo procesar ninguna fila.
+
+            #
+
+            # Permitimos eliminar solamente ese tipo de
+
+            # registro incompleto para poder reintentar.
+
+            #
+
+
+
+            if (
+
+                importacion_existente.estado
+
+                == "importada"
+
+                and importacion_existente.cantidad_registros
+
+                == 0
+
+            ):
+
+                db.delete(importacion_existente)
+
+                db.commit()
+
+
+
+            else:
+
+                return {
+
+                    "mensaje": (
+
+                        "El archivo ya había sido importado."
+
+                    ),
+
+                    "duplicado_archivo": True,
+
+                    "importacion_id": (
+
+                        importacion_existente.id
+
+                    ),
+
+                    "archivo": (
+
+                        importacion_existente.nombre_archivo
+
+                    ),
+
+                    "rut_empresa": (
+
+                        importacion_existente.rut_empresa
+
+                    ),
+
+                    "periodo": (
+
+                        importacion_existente.periodo
+
+                    ),
+
+                    "cantidad_registros": (
+
+                        importacion_existente
+
+                        .cantidad_registros
+
+                    ),
+
+                }
+
+
+
+    # --------------------------------------------------------
+
+    # LEER CSV
+
+    # --------------------------------------------------------
+
+
+
+    try:
+
+        df = pd.read_csv(
+
+            io.BytesIO(contenido),
+
+            sep=";",
+
+            encoding="latin1",
+
+            dtype=str,
+
+            index_col=False,
+
+        )
+
+
+
+    except Exception as e:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail=(
+
+                "No fue posible leer el archivo CSV: "
+
+                f"{str(e)}"
+
+            ),
+
+        )
+
+
+
+    # --------------------------------------------------------
+
+    # VALIDAR COLUMNAS
+
+    # --------------------------------------------------------
+
+
+
+    columnas_requeridas = [
+
+        "Tipo Doc",
+
+        "Rut cliente",
+
+        "Razon Social",
+
+        "Folio",
+
+        "Fecha Docto",
+
+        "Monto total",
+
+    ]
+
+
+
+    columnas_faltantes = [
+
+        columna
+
+        for columna in columnas_requeridas
+
+        if columna not in df.columns
+
+    ]
+
+
+
+    if columnas_faltantes:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail={
+
+                "mensaje": (
+
+                    "El archivo no tiene la estructura "
+
+                    "esperada del RCV."
+
+                ),
+
+                "columnas_faltantes": columnas_faltantes,
+
+                "columnas_detectadas": list(df.columns),
+
+            },
+
+        )
+
+
+
+    # --------------------------------------------------------
+
+    # IMPORTACIÓN TRANSACCIONAL
+
+    # --------------------------------------------------------
+
+
+
+    with SessionLocal() as db:
+
+
+
+        try:
+
+
+
+            # ------------------------------------------------
+
+            # CREAR REGISTRO DE IMPORTACIÓN
+
+            # ------------------------------------------------
+
+
+
+            importacion = ImportacionSII(
+
+                rut_empresa=rut_empresa,
+
+                periodo=periodo,
+
+                nombre_archivo=archivo.filename,
+
+                hash_archivo=hash_archivo,
+
+                cantidad_registros=0,
+
+                estado="procesando",
+
+            )
+
+
+
+            db.add(importacion)
+
+            db.flush()
+
+
+
+            # ------------------------------------------------
+
+            # CONTADORES
+
+            # ------------------------------------------------
+
+
+
+            documentos_importados = 0
+
+            documentos_duplicados = 0
+
+            documentos_invalidos = 0
+
+
+
+            # ------------------------------------------------
+
+            # PROCESAR CADA FILA
+
+            # ------------------------------------------------
+
+
+
+            for _, fila in df.iterrows():
+
+
+
+                tipo_documento = convertir_entero(
+
+                    fila.get("Tipo Doc")
+
+                )
+
+
+
+                rut_cliente = normalizar_rut(
+
+                    fila.get("Rut cliente")
+
+                )
+
+
+
+                folio = convertir_entero(
+
+                    fila.get("Folio")
+
+                )
+
+
+
+                fecha_documento = convertir_fecha(
+
+                    fila.get("Fecha Docto")
+
+                )
+
+
+
+                monto_total = convertir_decimal(
+
+                    fila.get("Monto total")
+
+                )
+
+
+
+                # --------------------------------------------
+
+                # VALIDACIONES MÍNIMAS
+
+                # --------------------------------------------
+
+
+
+                if (
+
+                    tipo_documento is None
+
+                    or rut_cliente is None
+
+                    or folio is None
+
+                    or fecha_documento is None
+
+                    or monto_total is None
+
+                ):
+
+                    documentos_invalidos += 1
+
+                    continue
+
+
+
+                # --------------------------------------------
+
+                # BUSCAR DOCUMENTO EXISTENTE
+
+                # --------------------------------------------
+
+
+
+                documento_existente = db.scalar(
+
+                    select(DocumentoTributario).where(
+
+                        DocumentoTributario.rut_empresa
+
+                        == rut_empresa,
+
+                        DocumentoTributario.tipo_documento
+
+                        == tipo_documento,
+
+                        DocumentoTributario.folio
+
+                        == folio,
+
+                    )
+
+                )
+
+
+
+                if documento_existente:
+
+                    documentos_duplicados += 1
+
+                    continue
+
+
+
+                # --------------------------------------------
+
+                # CREAR DOCUMENTO
+
+                # --------------------------------------------
+
+
+
+                documento = DocumentoTributario(
+
+                    importacion_sii_id=importacion.id,
+
+
+
+                    rut_empresa=rut_empresa,
+
+
+
+                    tipo_documento=tipo_documento,
+
+
+
+                    tipo_venta=normalizar_texto(
+
+                        fila.get("Tipo Venta")
+
+                    ),
+
+
+
+                    rut_cliente=rut_cliente,
+
+
+
+                    razon_social=normalizar_texto(
+
+                        fila.get("Razon Social")
+
+                    ),
+
+
+
+                    folio=folio,
+
+
+
+                    fecha_documento=fecha_documento,
+
+
+
+                    fecha_recepcion=convertir_fecha(
+
+                        fila.get("Fecha Recepcion")
+
+                    ),
+
+
+
+                    monto_exento=convertir_decimal(
+
+                        fila.get("Monto Exento")
+
+                    ),
+
+
+
+                    monto_neto=convertir_decimal(
+
+                        fila.get("Monto Neto")
+
+                    ),
+
+
+
+                    monto_iva=convertir_decimal(
+
+                        fila.get("Monto IVA")
+
+                    ),
+
+
+
+                    monto_total=monto_total,
+
+
+
+                    tipo_documento_referencia=convertir_entero(
+
+                        fila.get(
+
+                            "Tipo Docto. Referencia"
+
+                        )
+
+                    ),
+
+
+
+                    folio_documento_referencia=convertir_entero(
+
+                        fila.get(
+
+                            "Folio Docto. Referencia"
+
+                        )
+
+                    ),
+
+
+
+                    numero_interno=normalizar_texto(
+
+                        fila.get("Numero Interno")
+
+                    ),
+
+
+
+                    codigo_sucursal=normalizar_texto(
+    fila.get("Codigo Sucursal")
+),
+saldo_pendiente=monto_total,
+)
+
+
+
+                db.add(documento)
+
+
+
+                documentos_importados += 1
+
+
+
+            # ------------------------------------------------
+
+            # ACTUALIZAR IMPORTACIÓN
+
+            # ------------------------------------------------
+
+
+
+            importacion.cantidad_registros = (
+
+                documentos_importados
+
+            )
+
+
+
+            importacion.estado = "importada"
+
+
+
+            # ------------------------------------------------
+
+            # CONFIRMAR TRANSACCIÓN
+
+            # ------------------------------------------------
+
+
+
+            db.commit()
+
+
+
+            # ------------------------------------------------
+
+            # RESPUESTA
+
+            # ------------------------------------------------
+
+
+
+            return {
+
+                "mensaje": (
+
+                    "Archivo SII importado correctamente."
+
+                ),
+
+                "duplicado_archivo": False,
+
+                "importacion_id": importacion.id,
+
+                "archivo": archivo.filename,
+
+                "rut_empresa": rut_empresa,
+
+                "periodo": periodo,
+
+                "registros_archivo": len(df),
+
+                "documentos_importados": (
+
+                    documentos_importados
+
+                ),
+
+                "documentos_duplicados": (
+
+                    documentos_duplicados
+
+                ),
+
+                "documentos_invalidos": (
+
+                    documentos_invalidos
+
+                ),
+
+            }
+
+
+
+        except Exception as e:
+
+
+
+            # ------------------------------------------------
+
+            # SI FALLA, NO DEJAMOS IMPORTACIÓN PARCIAL
+
+            # ------------------------------------------------
+
+
+
+            db.rollback()
+
+
+
+            raise HTTPException(
+
+                status_code=500,
+
+                detail=(
+
+                    "La importación fue cancelada porque "
+
+                    "ocurrió un error durante el procesamiento: "
+
+                    f"{str(e)}"
+
+                ),
+
+            )
+
+
+
+            # ============================================================
+
+# IMPORTACIÓN CARTOLA SANTANDER
+
+# ============================================================
+
+
+
+def validar_digito_verificador_rut(cuerpo: str, dv: str) -> bool:
+    """Valida el dígito verificador de un RUT chileno."""
+    if not cuerpo.isdigit():
+        return False
+
+    cuerpo = cuerpo.lstrip("0") or "0"
+    factor = 2
+    suma = 0
+
+    for digito in reversed(cuerpo):
+        suma += int(digito) * factor
+        factor = 2 if factor == 7 else factor + 1
+
+    resto = 11 - (suma % 11)
+
+    if resto == 11:
+        dv_calculado = "0"
+    elif resto == 10:
+        dv_calculado = "K"
+    else:
+        dv_calculado = str(resto)
+
+    return dv_calculado == dv.upper()
+
+
+def detectar_rut_en_texto(texto: str | None) -> str | None:
+    """Detecta RUT chilenos dentro de descripciones bancarias Santander."""
+    if not texto:
+        return None
+
+    texto = str(texto).upper().strip()
+    patron = r"(?<!\d)(?:\d[\d.\- ]{6,12}[0-9K])(?!\d)"
+
+    for coincidencia in re.finditer(patron, texto):
+        candidato = coincidencia.group(0)
+        compacto = re.sub(r"[^0-9K]", "", candidato)
+
+        if len(compacto) < 8 or len(compacto) > 11:
+            continue
+
+        cuerpo = compacto[:-1]
+        dv = compacto[-1]
+        cuerpo_sin_ceros = cuerpo.lstrip("0")
+
+        if not 7 <= len(cuerpo_sin_ceros) <= 8:
+            continue
+
+        if not validar_digito_verificador_rut(cuerpo, dv):
+            continue
+
+        return f"{cuerpo_sin_ceros}-{dv}"
+
+    return None
+
+@app.get("/api/pagos/pendientes")
+def listar_abonos_pendientes_de_pago():
+    with SessionLocal() as db:
+        movimientos = db.scalars(
+            select(MovimientoBancario)
+            .where(MovimientoBancario.cargo_abono == "A")
+            .order_by(
+                MovimientoBancario.fecha_movimiento.desc(),
+                MovimientoBancario.id.desc(),
+            )
+        ).all()
+
+        pagos_existentes = {
+            pago.movimiento_bancario_id
+            for pago in db.scalars(select(Pago)).all()
+        }
+
+        return [
+            {
+                "movimiento_bancario_id": movimiento.id,
+                "fecha_movimiento": movimiento.fecha_movimiento,
+                "descripcion_original": movimiento.descripcion_original,
+                "numero_documento": movimiento.numero_documento,
+                "tipo_movimiento": movimiento.tipo_movimiento,
+                "monto": movimiento.monto,
+                "rut_pagador_detectado": movimiento.rut_pagador_detectado,
+                "nombre_pagador_detectado": movimiento.nombre_pagador_detectado,
+                "pago_creado": movimiento.id in pagos_existentes,
+            }
+            for movimiento in movimientos
+        ]
+
+
+
+@app.post("/api/pagos/crear-desde-abonos")
+def crear_pagos_desde_abonos():
+    with SessionLocal() as db:
+        movimientos = db.scalars(
+            select(MovimientoBancario)
+            .where(MovimientoBancario.cargo_abono == "A")
+            .order_by(
+                MovimientoBancario.fecha_movimiento.asc(),
+                MovimientoBancario.id.asc(),
+            )
+        ).all()
+
+        creados = 0
+        ya_existentes = 0
+
+        for movimiento in movimientos:
+            pago_existente = db.scalar(
+                select(Pago).where(
+                    Pago.movimiento_bancario_id == movimiento.id
+                )
+            )
+
+            if pago_existente:
+                ya_existentes += 1
+                continue
+
+            pagador = None
+
+            if movimiento.rut_pagador_detectado:
+                pagador = db.scalar(
+                    select(Pagador)
+                    .where(
+                        Pagador.rut_pagador == movimiento.rut_pagador_detectado,
+                        Pagador.autorizado == True,
+                    )
+                    .limit(1)
+                )
+
+            pago = Pago(
+                movimiento_bancario_id=movimiento.id,
+                cliente_id=pagador.cliente_id if pagador else None,
+                pagador_id=pagador.id if pagador else None,
+                fecha_pago=movimiento.fecha_movimiento,
+                monto_pago=movimiento.monto,
+                moneda="CLP",
+                medio_pago=movimiento.tipo_movimiento,
+                estado="pendiente",
+                observaciones=None,
+            )
+
+            db.add(pago)
+            creados += 1
+
+        db.commit()
+
+        return {
+            "mensaje": "Pagos creados desde abonos bancarios.",
+            "abonos_revisados": len(movimientos),
+            "pagos_creados": creados,
+            "pagos_ya_existentes": ya_existentes,
+        }
+@app.get("/api/pagos")
+def listar_pagos():
+    with SessionLocal() as db:
+        pagos = db.scalars(
+            select(Pago).order_by(
+                Pago.fecha_pago.desc(),
+                Pago.id.desc(),
+            )
+        ).all()
+
+        resultado = []
+
+        for pago in pagos:
+            movimiento = db.get(
+                MovimientoBancario,
+                pago.movimiento_bancario_id,
+            )
+
+            resultado.append({
+                "pago_id": pago.id,
+                "fecha_pago": pago.fecha_pago.isoformat()
+                if pago.fecha_pago else None,
+                "monto_pago": float(pago.monto_pago),
+                "estado": pago.estado,
+                "cliente_id": pago.cliente_id,
+                "movimiento_bancario_id": pago.movimiento_bancario_id,
+                "descripcion": movimiento.descripcion_original
+                if movimiento else None,
+                "rut_pagador_detectado": movimiento.rut_pagador_detectado
+                if movimiento else None,
+                "nombre_pagador_detectado": movimiento.nombre_pagador_detectado
+                if movimiento else None,
+            })
+
+        return resultado
+@app.get("/api/pagos/{pago_id}/propuestas-conciliacion")
+def propuestas_conciliacion(pago_id: int):
+    with SessionLocal() as db:
+        pago = db.get(Pago, pago_id)
+
+        if not pago:
+            raise HTTPException(
+                status_code=404,
+                detail="Pago no encontrado.",
+            )
+
+        movimiento = db.get(
+            MovimientoBancario,
+            pago.movimiento_bancario_id,
+        )
+
+        if not movimiento:
+            raise HTTPException(
+                status_code=404,
+                detail="Movimiento bancario asociado no encontrado.",
+            )
+
+        monto_pago = Decimal(pago.monto_pago)
+
+        # ---------------------------------------------------------
+        # 1. Identificar clientes candidatos
+        # ---------------------------------------------------------
+        clientes_candidatos = []
+
+        if pago.cliente_id:
+            clientes_candidatos.append(pago.cliente_id)
+
+        if pago.pagador_id:
+            pagador = db.get(
+                Pagador,
+                pago.pagador_id,
+            )
+
+            if pagador and pagador.cliente_id:
+                if pagador.cliente_id not in clientes_candidatos:
+                    clientes_candidatos.append(pagador.cliente_id)
+
+        # También buscamos clientes cuyo RUT corresponda
+        # directamente al RUT del pagador detectado.
+        if movimiento.rut_pagador_detectado:
+            rut_detectado = normalizar_rut(
+                movimiento.rut_pagador_detectado
+            )
+            clientes_encontrados = db.scalars(
+                select(Cliente)
+            ).all()
+
+            for cliente in clientes_encontrados:
+                if normalizar_rut(cliente.rut) == rut_detectado:
+                    if cliente.id not in clientes_candidatos:
+                        clientes_candidatos.append(cliente.id)
+
+        # ---------------------------------------------------------
+        # 2. Identificar clientes por texto de la descripción bancaria
+        # ---------------------------------------------------------
+        if movimiento.descripcion_original:
+            descripcion = movimiento.descripcion_original.strip()
+
+            palabras = [
+                palabra.strip(".,;:/-_()[]{}")
+                for palabra in descripcion.split()
+                if len(palabra.strip(".,;:/-_()[]{}")) >= 4
+            ]
+
+            clientes_por_texto = []
+
+            for palabra in palabras:
+                clientes_encontrados = db.scalars(
+                    select(Cliente).where(
+                        (Cliente.razon_social.ilike(f"%{palabra}%"))
+                        | (Cliente.nombre_fantasia.ilike(f"%{palabra}%"))
+                    )
+                ).all()
+
+                for cliente in clientes_encontrados:
+                    if cliente.id not in clientes_por_texto:
+                        clientes_por_texto.append(cliente.id)
+
+            for cliente_id in clientes_por_texto:
+                if cliente_id not in clientes_candidatos:
+                    clientes_candidatos.append(cliente_id)
+
+        # ---------------------------------------------------------
+        # 3. Obtener documentos candidatos
+        # ---------------------------------------------------------
+        documentos = []
+
+        if clientes_candidatos:
+            clientes = db.scalars(
+                select(Cliente).where(
+                    Cliente.id.in_(clientes_candidatos)
+                )
+            ).all()
+
+            ruts_clientes = [
+                cliente.rut
+                for cliente in clientes
+                if cliente.rut
+            ]
+
+            if ruts_clientes:
+                documentos = db.scalars(
+                    select(DocumentoTributario)
+                    .where(
+                        DocumentoTributario.rut_cliente.in_(ruts_clientes),
+                        DocumentoTributario.saldo_pendiente > 0,
+                        DocumentoTributario.fecha_documento <= pago.fecha_pago,
+                    )
+                    .order_by(
+                        DocumentoTributario.fecha_documento.desc(),
+                        DocumentoTributario.folio.desc(),
+                    )
+                ).all()
+
+        # ---------------------------------------------------------
+        # 4. Si no conocemos al cliente, buscar candidatos
+        #    por monto y fecha.
+        # ---------------------------------------------------------
+        if not documentos:
+            documentos = db.scalars(
+                select(DocumentoTributario)
+                .where(
+                    DocumentoTributario.saldo_pendiente > 0,
+                    DocumentoTributario.fecha_documento <= pago.fecha_pago,
+                )
+                .order_by(
+                    DocumentoTributario.fecha_documento.desc(),
+                    DocumentoTributario.folio.desc(),
+                )
+                .limit(300)
+            ).all()
+
+ 
+        
+        # ---------------------------------------------------------
+        # 5. Evaluar documentos individuales y combinaciones
+        # ---------------------------------------------------------
+        propuestas = []
+
+        # Cargar clientes una sola vez para evitar consultas
+        # repetidas a la base de datos por cada propuesta.
+        clientes_por_rut = {
+            normalizar_rut(cliente.rut): cliente
+            for cliente in db.scalars(select(Cliente)).all()
+            if normalizar_rut(cliente.rut)
+        }
+
+        limite_inferior = max(
+            Decimal("0"),
+            monto_pago - Decimal("5000"),
+        )
+        limite_superior = monto_pago + Decimal("5000")
+
+        def agregar_propuesta(docs, total, tipo):
+            diferencia = total - monto_pago
+            diferencia_abs = abs(diferencia)
+
+            if diferencia_abs > Decimal("5000"):
+                return
+
+            documentos_futuros = [
+                doc
+                for doc in docs
+                if doc.fecha_documento
+                and doc.fecha_documento > pago.fecha_pago
+            ]
+
+            propuesta = {
+                "cliente_id": None,
+                "rut_cliente": None,
+                "cliente_nombre": None,
+                "documentos": [
+                    {
+                        "documento_id": doc.id,
+                        "tipo_documento": doc.tipo_documento,
+                        "folio": doc.folio,
+                        "fecha_documento": doc.fecha_documento,
+                        "monto_total": float(doc.monto_total),
+                        "saldo_pendiente": float(doc.saldo_pendiente),
+                    }
+                    for doc in docs
+                ],
+                "cantidad_documentos": len(docs),
+                "total_documentos": float(total),
+                "monto_pago": float(monto_pago),
+                "diferencia": float(diferencia),
+                "diferencia_abs": float(diferencia_abs),
+                "tipo": tipo,
+                "documentos_futuros": len(documentos_futuros),
+            }
+
+            # Identificar al cliente usando el RUT normalizado.
+            ruts = {
+                normalizar_rut(doc.rut_cliente)
+                for doc in docs
+                if normalizar_rut(doc.rut_cliente)
+            }
+
+            if len(ruts) == 1:
+                rut_normalizado = next(iter(ruts))
+                cliente = clientes_por_rut.get(rut_normalizado)
+
+                if cliente:
+                    propuesta["cliente_id"] = cliente.id
+                    propuesta["rut_cliente"] = cliente.rut
+                    propuesta["cliente_nombre"] = cliente.razon_social
+
+            propuestas.append(propuesta)
+
+        # Evaluar documentos individuales.
+        for doc in documentos:
+            saldo = Decimal(str(doc.saldo_pendiente))
+
+            if limite_inferior <= saldo <= limite_superior:
+                agregar_propuesta(
+                    [doc],
+                    saldo,
+                    "DOCUMENTO_UNICO",
+                )
+
+        # Preparar candidatos válidos para las combinaciones.
+        # Solo se consideran saldos positivos que no superen
+        # el monto del pago más el margen permitido.
+        documentos_combinables = [
+            doc
+            for doc in documentos
+            if Decimal(str(doc.saldo_pendiente)) > 0
+            and Decimal(str(doc.saldo_pendiente)) <= limite_superior
+        ]
+
+        documentos_combinables.sort(
+            key=lambda doc: Decimal(str(doc.saldo_pendiente))
+        )
+
+        saldos = [
+            Decimal(str(doc.saldo_pendiente))
+            for doc in documentos_combinables
+        ]
+
+        # Combinaciones de 2, 3 y 4 documentos.
+        # Como los saldos están ordenados y son positivos,
+        # se puede abandonar una rama cuando el total excede
+        # el límite superior.
+
+        # Buscar combinaciones con un límite de trabajo para
+        # evitar que la solicitud quede ejecutándose indefinidamente.
+        nodos_visitados = 0
+        limite_nodos = 100000
+        busqueda_limitada = False
+
+        def buscar_combinaciones(inicio, cantidad_restante, total, seleccion):
+            nonlocal nodos_visitados, busqueda_limitada
+
+            if nodos_visitados >= limite_nodos:
+                busqueda_limitada = True
+                return
+
+            nodos_visitados += 1
+
+            if cantidad_restante == 0:
+                if limite_inferior <= total <= limite_superior:
+                    agregar_propuesta(
+                        seleccion,
+                        total,
+                        f"COMBINACION_{len(seleccion)}",
+                    )
+                return
+
+            ultimo_inicio = len(documentos_combinables) - cantidad_restante
+
+            for indice in range(inicio, ultimo_inicio + 1):
+                if nodos_visitados >= limite_nodos:
+                    busqueda_limitada = True
+                    return
+                if seleccion:
+                    rut_base = normalizar_rut(
+                        seleccion[0].rut_cliente
+                    )
+                    rut_actual = normalizar_rut(
+                        documentos_combinables[indice].rut_cliente
+                    )
+
+                    if not rut_base or not rut_actual or rut_base != rut_actual:
+                        continue
+
+                nuevo_total = total + saldos[indice]
+
+                if nuevo_total > limite_superior:
+                    break
+
+                indices_faltantes = cantidad_restante - 1
+                minimo_posible = nuevo_total
+
+                for siguiente in range(
+                    indice + 1,
+                    indice + 1 + indices_faltantes,
+                ):
+                    minimo_posible += saldos[siguiente]
+
+                if minimo_posible > limite_superior:
+                    continue
+
+                buscar_combinaciones(
+                    indice + 1,
+                    cantidad_restante - 1,
+                    nuevo_total,
+                    seleccion + [documentos_combinables[indice]],
+                )
+
+                if busqueda_limitada:
+                    return
+
+        for cantidad in range(2, 5):
+            if len(documentos_combinables) >= cantidad:
+                buscar_combinaciones(
+                    0,
+                    cantidad,
+                    Decimal("0"),
+                    [],
+                )
+
+            if busqueda_limitada:
+                break
+
+
+        # ---------------------------------------------------------
+        # 6. Ordenar propuestas
+        # ---------------------------------------------------------
+        def clave_orden(propuesta):
+            diferencia = Decimal(
+                str(propuesta["diferencia_abs"])
+            )
+
+            futuros = propuesta["documentos_futuros"]
+
+            cliente_conocido = (
+                propuesta["cliente_id"] is not None
+            )
+
+            return (
+                diferencia,
+                futuros,
+                0 if cliente_conocido else 1,
+                propuesta["cantidad_documentos"],
+            )
+
+        propuestas.sort(
+            key=clave_orden
+        )
+
+        # Evitar devolver demasiadas propuestas.
+        propuestas = propuestas[:20]
+
+        # ---------------------------------------------------------
+        # 7. Nivel preliminar de confianza
+        # ---------------------------------------------------------
+        for propuesta in propuestas:
+            diferencia = Decimal(
+                str(propuesta["diferencia_abs"])
+            )
+
+            futuros = propuesta["documentos_futuros"]
+
+            if diferencia == 0 and futuros == 0:
+                nivel = "ALTA"
+
+            elif diferencia <= Decimal("1000") and futuros == 0:
+                nivel = "MEDIA"
+
+            elif diferencia <= Decimal("5000"):
+                nivel = "BAJA"
+
+            else:
+                nivel = "MANUAL"
+
+            propuesta["nivel_propuesta"] = nivel
+
+        return {
+            "pago_id": pago.id,
+            "fecha_pago": pago.fecha_pago,
+            "monto_pago": float(monto_pago),
+            "rut_pagador_detectado": movimiento.rut_pagador_detectado,
+            "nombre_pagador_detectado": movimiento.nombre_pagador_detectado,
+            "descripcion_original": movimiento.descripcion_original,
+            "propuestas": propuestas,
+        }
+
+class DocumentoAceptacion(BaseModel):
+    documento_id: int
+    monto_aplicado: Decimal
+
+
+class AceptarPropuestaRequest(BaseModel):
+    documentos: list[DocumentoAceptacion]
+    cliente_id: int | None = None
+    observaciones: str | None = None
+
+
+@app.post("/api/pagos/{pago_id}/aceptar-propuesta")
+def aceptar_propuesta_conciliacion(
+    pago_id: int,
+    datos: AceptarPropuestaRequest,
+):
+    from datetime import datetime
+    from sqlalchemy import select
+
+    if not datos.documentos:
+        raise HTTPException(
+            status_code=400,
+            detail="Debes seleccionar al menos un documento.",
+        )
+
+    ids = [d.documento_id for d in datos.documentos]
+
+    if len(ids) != len(set(ids)):
+        raise HTTPException(
+            status_code=400,
+            detail="La propuesta contiene documentos duplicados.",
+        )
+
+    if any(d.monto_aplicado <= 0 for d in datos.documentos):
+        raise HTTPException(
+            status_code=400,
+            detail="Los montos aplicados deben ser mayores que cero.",
+        )
+
+    total_aplicado = sum(
+        (d.monto_aplicado for d in datos.documentos),
+        Decimal("0.00"),
+    )
+
+    with SessionLocal() as db:
+        try:
+            pago = db.scalar(
+                select(Pago)
+                .where(Pago.id == pago_id)
+                .with_for_update()
+            )
+
+            if not pago:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Pago no encontrado.",
+                )
+
+            if pago.estado == "conciliado":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Este pago ya está conciliado.",
+                )
+
+            aplicaciones_existentes = db.scalar(
+                select(func.count())
+                .select_from(AplicacionPago)
+                .where(AplicacionPago.pago_id == pago_id)
+            )
+
+            if aplicaciones_existentes:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Este pago ya tiene aplicaciones registradas.",
+                )
+
+            if total_aplicado != Decimal(str(pago.monto_pago)):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "El total de los documentos debe coincidir "
+                        "exactamente con el monto del pago. "
+                        "No se aplicó ningún saldo."
+                    ),
+                )
+
+            documentos_db = db.scalars(
+                select(DocumentoTributario)
+                .where(DocumentoTributario.id.in_(ids))
+                .with_for_update()
+            ).all()
+
+            if len(documentos_db) != len(ids):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Uno o más documentos no existen.",
+                )
+
+            documentos_por_id = {
+                doc.id: doc for doc in documentos_db
+            }
+
+            ruts = {doc.rut_cliente for doc in documentos_db}
+
+            if len(ruts) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Los documentos pertenecen a distintos clientes. "
+                        "No se aplicó ningún saldo."
+                    ),
+                )
+
+            rut_documentos = next(iter(ruts))
+
+            if datos.cliente_id is not None:
+                cliente = db.get(Cliente, datos.cliente_id)
+
+                if not cliente or cliente.rut != rut_documentos:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "El cliente seleccionado no coincide "
+                            "con el RUT de las facturas."
+                        ),
+                    )
+            else:
+                cliente = db.scalar(
+                    select(Cliente)
+                    .where(Cliente.rut == rut_documentos)
+                    .limit(1)
+                )
+
+            for item in datos.documentos:
+                doc = documentos_por_id[item.documento_id]
+                monto = Decimal(str(item.monto_aplicado))
+                saldo = Decimal(str(doc.saldo_pendiente))
+
+                if monto > saldo:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"El monto solicitado supera el saldo "
+                            f"pendiente del documento folio {doc.folio}."
+                        ),
+                    )
+
+            fecha_revision = datetime.utcnow()
+
+            revision = RevisionConciliacion(
+                pago_id=pago.id,
+                estado="ACEPTADA",
+                cliente_propuesto_id=datos.cliente_id,
+                cliente_confirmado_id=cliente.id if cliente else None,
+                fecha_revision=fecha_revision,
+                observaciones=datos.observaciones,
+                evidencia_propuesta=(
+                    f"Documentos aceptados: {', '.join(map(str, ids))}"
+                ),
+            )
+            db.add(revision)
+            db.flush()
+
+            for item in datos.documentos:
+                doc = documentos_por_id[item.documento_id]
+                monto = Decimal(str(item.monto_aplicado))
+
+                db.add(
+                    DetalleRevisionConciliacion(
+                        revision_id=revision.id,
+                        documento_id=doc.id,
+                        monto_propuesto=monto,
+                        observaciones=datos.observaciones,
+                    )
+                )
+
+                db.add(
+                    AplicacionPago(
+                        pago_id=pago.id,
+                        documento_id=doc.id,
+                        monto_aplicado=monto,
+                        fecha_aplicacion=pago.fecha_pago,
+                        observaciones=datos.observaciones,
+                    )
+                )
+
+                nuevo_saldo = (
+                    Decimal(str(doc.saldo_pendiente)) - monto
+                )
+                doc.saldo_pendiente = nuevo_saldo
+
+                if nuevo_saldo == 0:
+                    doc.estado_pago = "PAGADO"
+                else:
+                    doc.estado_pago = "PARCIAL"
+
+            pago.estado = "conciliado"
+            if cliente:
+                pago.cliente_id = cliente.id
+
+            db.commit()
+
+            return {
+                "mensaje": "Propuesta aceptada y conciliación registrada.",
+                "pago_id": pago.id,
+                "revision_id": revision.id,
+                "cliente_id": cliente.id if cliente else None,
+                "total_aplicado": float(total_aplicado),
+                "documentos_actualizados": len(documentos_db),
+            }
+
+        except Exception:
+            db.rollback()
+            raise
+
+@app.post("/api/pagos/actualizar-identificacion")
+def actualizar_identificacion_pagos():
+    with SessionLocal() as db:
+        pagos = db.scalars(
+            select(Pago).where(
+                Pago.cliente_id.is_(None)
+            ).order_by(Pago.id.asc())
+        ).all()
+
+        actualizados = 0
+        sin_identificar = 0
+        identificados_por_pagador = 0
+        identificados_por_rut_cliente = 0
+
+        for pago in pagos:
+            movimiento = db.scalar(
+                select(MovimientoBancario).where(
+                    MovimientoBancario.id == pago.movimiento_bancario_id
+                )
+            )
+
+            if not movimiento or not movimiento.rut_pagador_detectado:
+                sin_identificar += 1
+                continue
+
+            # Primera señal: Pagador autorizado
+            pagador = db.scalar(
+                select(Pagador)
+                .where(
+                    Pagador.rut_pagador == movimiento.rut_pagador_detectado,
+                    Pagador.autorizado == True,
+                )
+                .limit(1)
+            )
+
+            if pagador:
+                pago.pagador_id = pagador.id
+                pago.cliente_id = pagador.cliente_id
+                actualizados += 1
+                identificados_por_pagador += 1
+                continue
+
+            # Segunda señal: RUT del movimiento coincide
+            # directamente con el RUT del cliente
+            cliente = db.scalar(
+                select(Cliente)
+                .where(
+                    Cliente.rut == movimiento.rut_pagador_detectado
+                )
+                .limit(1)
+            )
+
+            if cliente:
+                pago.cliente_id = cliente.id
+                actualizados += 1
+                identificados_por_rut_cliente += 1
+                continue
+
+            sin_identificar += 1
+
+        db.commit()
+
+        return {
+            "mensaje": "Identificación de pagos actualizada.",
+            "pagos_revisados": len(pagos),
+            "pagos_actualizados": actualizados,
+            "identificados_por_pagador": identificados_por_pagador,
+            "identificados_por_rut_cliente": identificados_por_rut_cliente,
+            "pagos_sin_identificar": sin_identificar,
+        }
+@app.get("/api/pagos/resumen-rut")
+def resumen_rut_pagos():
+    with SessionLocal() as db:
+        resultados = db.execute(
+            select(
+                MovimientoBancario.rut_pagador_detectado,
+                func.count(Pago.id).label("cantidad_pagos"),
+                func.sum(Pago.monto_pago).label("monto_total"),
+            )
+            .join(
+                Pago,
+                Pago.movimiento_bancario_id == MovimientoBancario.id,
+            )
+            .where(
+                Pago.cliente_id.is_(None),
+                MovimientoBancario.rut_pagador_detectado.is_not(None),
+            )
+            .group_by(MovimientoBancario.rut_pagador_detectado)
+            .order_by(
+                func.count(Pago.id).desc(),
+                func.sum(Pago.monto_pago).desc(),
+            )
+        ).all()
+
+        return [
+            {
+                "rut_pagador": rut,
+                "cantidad_pagos": cantidad,
+                "monto_total": monto_total,
+            }
+            for rut, cantidad, monto_total in resultados
+        ]
+@app.get("/api/movimientos-bancarios")
+def listar_movimientos_bancarios(solo_sin_rut: bool = False):
+    with SessionLocal() as db:
+        query = select(MovimientoBancario).order_by(
+            MovimientoBancario.fecha_movimiento.desc(),
+            MovimientoBancario.id.desc(),
+        )
+
+        if solo_sin_rut:
+            query = query.where(
+                MovimientoBancario.rut_pagador_detectado.is_(None)
+            )
+
+        movimientos = db.scalars(query).all()
+
+        return [
+            {
+                "id": m.id,
+                "fecha_movimiento": m.fecha_movimiento,
+                "descripcion_original": m.descripcion_original,
+                "numero_documento": m.numero_documento,
+                "sucursal": m.sucursal,
+                "tipo_movimiento": m.tipo_movimiento,
+                "monto": m.monto,
+                "cargo_abono": m.cargo_abono,
+                "monto_abono": m.monto_abono,
+                "monto_cargo": m.monto_cargo,
+                "rut_pagador_detectado": m.rut_pagador_detectado,
+                "nombre_pagador_detectado": m.nombre_pagador_detectado,
+            }
+            for m in movimientos
+        ]
+@app.get("/api/pagos/rut/{rut_pagador}")
+def consultar_pagos_por_rut(rut_pagador: str):
+    with SessionLocal() as db:
+        resultados = db.execute(
+            select(
+                Pago.id,
+                Pago.fecha_pago,
+                Pago.monto_pago,
+                Pago.estado,
+                MovimientoBancario.id.label("movimiento_id"),
+                MovimientoBancario.descripcion_original,
+                MovimientoBancario.tipo_movimiento,
+            )
+            .join(
+                MovimientoBancario,
+                MovimientoBancario.id == Pago.movimiento_bancario_id,
+            )
+            .where(
+                MovimientoBancario.rut_pagador_detectado == rut_pagador
+            )
+            .order_by(
+                Pago.fecha_pago.asc(),
+                Pago.id.asc(),
+            )
+        ).all()
+
+        return [
+            {
+                "pago_id": pago_id,
+                "fecha_pago": fecha_pago,
+                "monto_pago": monto_pago,
+                "estado": estado,
+                "movimiento_id": movimiento_id,
+                "descripcion": descripcion,
+                "tipo_movimiento": tipo_movimiento,
+            }
+            for (
+                pago_id,
+                fecha_pago,
+                monto_pago,
+                estado,
+                movimiento_id,
+                descripcion,
+                tipo_movimiento,
+            ) in resultados
+        ]
+@app.get("/api/pagos/rut/{rut_pagador}/candidatos")
+def candidatos_por_rut_pagador(rut_pagador: str):
+    with SessionLocal() as db:
+
+        # --------------------------------------------------------
+        # 1. OBTENER PAGOS DEL RUT PAGADOR
+        # --------------------------------------------------------
+
+        pagos = db.execute(
+            select(
+                Pago.id,
+                Pago.fecha_pago,
+                Pago.monto_pago,
+            )
+            .join(
+                MovimientoBancario,
+                MovimientoBancario.id == Pago.movimiento_bancario_id,
+            )
+            .where(
+                MovimientoBancario.rut_pagador_detectado == rut_pagador
+            )
+            .order_by(
+                Pago.fecha_pago.asc(),
+                Pago.id.asc(),
+            )
+        ).all()
+
+        resultado = []
+
+        # --------------------------------------------------------
+        # 2. PROCESAR CADA PAGO
+        # --------------------------------------------------------
+
+        for pago_id, fecha_pago, monto_pago in pagos:
+
+            documentos = db.scalars(
+                select(DocumentoTributario)
+                .where(
+                    DocumentoTributario.saldo_pendiente > 0
+                )
+                .order_by(
+                    DocumentoTributario.fecha_documento.desc(),
+                    DocumentoTributario.folio.desc(),
+                )
+                .limit(200)
+            ).all()
+
+            candidatos = []
+
+            # ----------------------------------------------------
+            # 3. BUSCAR CANDIDATOS
+            # ----------------------------------------------------
+
+            for documento in documentos:
+
+                # -----------------------------------------------
+                # BUSCAR CLIENTE POR RUT DEL DOCUMENTO
+                # -----------------------------------------------
+
+                cliente = db.scalar(
+                    select(Cliente)
+                    .where(
+                        Cliente.rut == documento.rut_cliente
+                    )
+                    .limit(1)
+                )
+
+                if cliente:
+                    cliente_id = cliente.id
+                    razon_social_cliente = cliente.razon_social
+                else:
+                    cliente_id = None
+                    razon_social_cliente = documento.razon_social
+
+                # -----------------------------------------------
+                # CALCULAR DIFERENCIA
+                # -----------------------------------------------
+
+                diferencia = (
+                    documento.saldo_pendiente - monto_pago
+                )
+
+                diferencia_abs = abs(diferencia)
+
+                # -----------------------------------------------
+                # NIVEL DE COINCIDENCIA POR MONTO
+                # -----------------------------------------------
+
+                if diferencia == 0:
+                    nivel_monto = "EXACTA"
+
+                elif diferencia_abs <= 1000:
+                    nivel_monto = "MUY_CERCANA"
+
+                elif diferencia_abs <= 10000:
+                    nivel_monto = "CERCANA"
+
+                elif diferencia_abs <= 50000:
+                    nivel_monto = "MEDIA"
+
+                else:
+                    continue
+
+                # -----------------------------------------------
+                # DIFERENCIA DE FECHAS
+                # -----------------------------------------------
+
+                if documento.fecha_documento:
+                    dias_diferencia = (
+                        fecha_pago - documento.fecha_documento
+                    ).days
+                else:
+                    dias_diferencia = None
+
+                # -----------------------------------------------
+                # PRIORIDAD POR FECHA
+                # -----------------------------------------------
+
+                if dias_diferencia is None:
+                    prioridad_fecha = "SIN_FECHA"
+
+                elif dias_diferencia >= 0:
+                    # Documento anterior o del mismo día
+                    prioridad_fecha = "ALTA"
+
+                elif dias_diferencia >= -30:
+                    # Documento futuro cercano
+                    prioridad_fecha = "MEDIA"
+
+                else:
+                    # Documento muy posterior al pago
+                    prioridad_fecha = "BAJA"
+
+                # -----------------------------------------------
+                # PUNTAJE
+                # -----------------------------------------------
+
+                puntaje = 0
+
+                # MONTO
+                if diferencia == 0:
+                    puntaje += 700
+
+                elif diferencia_abs <= 1000:
+                    puntaje += 500
+
+                elif diferencia_abs <= 10000:
+                    puntaje += 300
+
+                elif diferencia_abs <= 50000:
+                    puntaje += 100
+
+                # FECHA
+                if dias_diferencia is not None:
+
+                    if 0 <= dias_diferencia <= 30:
+                        puntaje += 150
+
+                    elif dias_diferencia > 30:
+                        puntaje += 100
+
+                    elif -30 <= dias_diferencia < 0:
+                        puntaje += 40
+
+                    else:
+                        puntaje -= 50
+
+                # CLIENTE IDENTIFICADO
+                if cliente_id is not None:
+                    puntaje += 100
+
+                candidatos.append(
+                    {
+                        "cliente_id": cliente_id,
+                        "rut_cliente": documento.rut_cliente,
+                        "razon_social": razon_social_cliente,
+
+                        "documento_id": documento.id,
+                        "tipo_documento": documento.tipo_documento,
+                        "folio": documento.folio,
+
+                        "fecha_documento": documento.fecha_documento,
+
+                        "monto_documento": documento.monto_total,
+                        "saldo_pendiente": documento.saldo_pendiente,
+
+                        "diferencia": diferencia,
+                        "nivel_monto": nivel_monto,
+
+                        "dias_diferencia": dias_diferencia,
+                        "prioridad_fecha": prioridad_fecha,
+
+                        "puntaje": puntaje,
+                    }
+                )
+
+            # ----------------------------------------------------
+            # 4. ORDENAR CANDIDATOS
+            # ----------------------------------------------------
+
+            candidatos.sort(
+                key=lambda x: (
+                    -x["puntaje"],
+                    abs(x["diferencia"]),
+                    x["fecha_documento"]
+                    if x["fecha_documento"]
+                    else fecha_pago,
+                )
+            )
+
+            # ----------------------------------------------------
+            # 5. GUARDAR RESULTADO DEL PAGO
+            # ----------------------------------------------------
+
+            resultado.append(
+                {
+                    "pago_id": pago_id,
+                    "fecha_pago": fecha_pago,
+                    "monto_pago": monto_pago,
+                    "candidatos": candidatos[:20],
+                }
+            )
+
+        # --------------------------------------------------------
+        # 6. RESPUESTA
+        # --------------------------------------------------------
+
+        return {
+            "rut_pagador": rut_pagador,
+            "pagos": resultado,
+        }
+       
+@app.post("/api/movimientos-bancarios/importar-santander")
+
+async def importar_cartola_santander(
+
+    archivo: UploadFile = File(...),
+
+    cuenta_bancaria_gh_id: int = Form(...),
+
+):
+
+    """
+
+    Importa una cartola histórica Santander en formato XLSX.
+
+
+
+    Primera etapa:
+
+    - Lee los movimientos de la hoja "Detalle movimientos".
+
+    - Guarda cargos y abonos.
+
+    - Detecta RUT dentro de la descripción.
+
+    - No realiza conciliación automática.
+
+    """
+
+
+
+    if not archivo.filename:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="No se recibió ningún archivo.",
+
+        )
+
+
+
+    nombre_archivo = archivo.filename
+
+
+
+    if not nombre_archivo.lower().endswith(".xlsx"):
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="La cartola Santander debe estar en formato .xlsx.",
+
+        )
+
+
+
+    contenido = await archivo.read()
+
+
+
+    if not contenido:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="El archivo está vacío.",
+
+        )
+
+
+
+    # --------------------------------------------------------
+
+    # LEER ARCHIVO SANTANDER
+
+    # --------------------------------------------------------
+
+
+
+    try:
+
+        excel = pd.ExcelFile(io.BytesIO(contenido), engine="openpyxl")
+
+
+
+        if "Cartola Historica CtaCte" not in excel.sheet_names:
+
+            raise HTTPException(
+
+                status_code=400,
+
+                detail={
+
+                    "mensaje": (
+
+                        "La cartola Santander no contiene la hoja 'Cartola Historica CtaCte'."
+
+                    ),
+
+                    "hojas_detectadas": excel.sheet_names,
+
+                },
+
+            )
+
+
+
+        df = pd.read_excel(
+
+            io.BytesIO(contenido),
+
+            sheet_name="Cartola Historica CtaCte",
+
+            header=None,
+
+            engine="openpyxl",
+
+        )
+
+
+
+    except HTTPException:
+
+        raise
+
+
+
+    except Exception as e:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail=f"No fue posible leer la cartola Santander: {str(e)}",
+
+        )
+
+
+
+    # --------------------------------------------------------
+
+    # BUSCAR FILA DE ENCABEZADOS
+
+    # --------------------------------------------------------
+
+
+
+    fila_encabezado = None
+
+
+
+    for indice, fila in df.iterrows():
+
+        valores = [
+
+            str(valor).strip().upper()
+
+            for valor in fila.tolist()
+
+            if pd.notna(valor)
+
+        ]
+
+
+
+        if (
+
+            "MONTO" in valores
+
+            and "FECHA" in valores
+
+            and "CARGO/ABONO" in valores
+
+        ):
+
+            fila_encabezado = indice
+
+            break
+
+
+
+    if fila_encabezado is None:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail=(
+
+                "No se encontró la estructura esperada "
+
+                "de movimientos Santander."
+
+            ),
+
+        )
+
+
+
+    # --------------------------------------------------------
+
+    # RELEER USANDO EL ENCABEZADO ENCONTRADO
+
+    # --------------------------------------------------------
+
+
+
+    df_movimientos = pd.read_excel(
+
+        io.BytesIO(contenido),
+
+        sheet_name="Cartola Historica CtaCte",
+
+        header=fila_encabezado,
+
+        engine="openpyxl",
+
+    )
+
+
+
+    # Normalizar nombres de columnas
+
+    df_movimientos.columns = [
+
+        str(columna).strip()
+
+        for columna in df_movimientos.columns
+
+    ]
+
+
+
+    columnas_requeridas = [
+
+        "MONTO",
+
+        "DESCRIPCIÓN MOVIMIENTO",
+
+        "FECHA",
+
+        "N° DOCUMENTO",
+
+        "SUCURSAL",
+
+        "CARGO/ABONO",
+
+    ]
+
+
+
+    columnas_faltantes = [
+
+        columna
+
+        for columna in columnas_requeridas
+
+        if columna not in df_movimientos.columns
+
+    ]
+
+
+
+    if columnas_faltantes:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail={
+
+                "mensaje": (
+
+                    "La cartola Santander no tiene "
+
+                    "todas las columnas esperadas."
+
+                ),
+
+                "columnas_faltantes": columnas_faltantes,
+
+                "columnas_detectadas": list(df_movimientos.columns),
+
+            },
+
+        )
+
+
+
+    # --------------------------------------------------------
+
+    # FILTRAR FILAS REALES DE MOVIMIENTOS
+
+    # --------------------------------------------------------
+
+
+
+    df_movimientos = df_movimientos[
+
+        df_movimientos["FECHA"].notna()
+
+        & df_movimientos["MONTO"].notna()
+
+        & df_movimientos["CARGO/ABONO"].notna()
+
+    ].copy()
+
+
+
+    if df_movimientos.empty:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="No se encontraron movimientos bancarios en la cartola.",
+
+        )
+
+
+
+    # --------------------------------------------------------
+
+    # CONECTAR A BASE DE DATOS
+
+    # --------------------------------------------------------
+
+
+
+    with SessionLocal() as db:
+
+        try:
+
+            cuenta = db.get(
+
+                CuentaBancariaGH,
+
+                cuenta_bancaria_gh_id,
+
+            )
+
+
+
+            if cuenta is None:
+
+                raise HTTPException(
+
+                    status_code=404,
+
+                    detail=(
+
+                        "No existe la cuenta bancaria GH indicada."
+
+                    ),
+
+                )
+
+
+
+            # ------------------------------------------------
+
+            # CREAR IMPORTACIÓN
+
+            # ------------------------------------------------
+
+
+
+            importacion = ImportacionBancaria(
+
+                cuenta_bancaria_gh_id=cuenta_bancaria_gh_id,
+
+                nombre_archivo=nombre_archivo,
+
+                fecha_desde=None,
+
+                fecha_hasta=None,
+
+                cantidad_registros=0,
+
+                estado="procesando",
+
+            )
+
+
+
+            db.add(importacion)
+
+            db.flush()
+
+
+
+            cantidad_importados = 0
+
+            cantidad_rut_detectado = 0
+
+            cantidad_revision = 0
+
+
+
+            fechas = []
+
+
+
+            # ------------------------------------------------
+
+            # PROCESAR MOVIMIENTOS
+
+            # ------------------------------------------------
+
+
+
+            for _, fila in df_movimientos.iterrows():
+
+
+
+                try:
+
+                    fecha_valor = fila["FECHA"]
+
+
+
+                    fecha = pd.to_datetime(
+
+                        fecha_valor,
+
+                        dayfirst=True,
+
+                        errors="coerce",
+
+                    )
+
+
+
+                    if pd.isna(fecha):
+
+                        continue
+
+
+
+                    fecha = fecha.date()
+
+
+
+                    monto_valor = fila["MONTO"]
+
+
+
+                    if isinstance(monto_valor, str):
+
+                        monto_limpio = (
+
+                            monto_valor
+
+                            .replace(".", "")
+
+                            .replace(",", ".")
+
+                            .replace("$", "")
+
+                            .strip()
+
+                        )
+
+                    else:
+
+                        monto_limpio = monto_valor
+
+
+
+                    monto = Decimal(str(monto_limpio))
+
+
+
+                    descripcion = str(
+
+                        fila["DESCRIPCIÓN MOVIMIENTO"]
+
+                    ).strip()
+
+
+
+                    if descripcion == "nan":
+
+                        descripcion = ""
+
+
+
+                    numero_documento = str(
+
+                        fila["N° DOCUMENTO"]
+
+                    ).strip()
+
+
+
+                    if numero_documento == "nan":
+
+                        numero_documento = None
+
+
+
+                    sucursal = str(
+
+                        fila["SUCURSAL"]
+
+                    ).strip()
+
+
+
+                    if sucursal == "nan":
+
+                        sucursal = None
+
+
+
+                    cargo_abono = str(
+
+                        fila["CARGO/ABONO"]
+
+                    ).strip().upper()
+
+
+
+                    # ------------------------------------------------
+
+                    # DETECTAR RUT
+
+                    # ------------------------------------------------
+
+
+
+                    rut_detectado = detectar_rut_en_texto(
+
+                        descripcion
+
+                    )
+
+
+
+                    if rut_detectado:
+
+                        cantidad_rut_detectado += 1
+
+                    else:
+
+                        cantidad_revision += 1
+
+
+
+                    # ------------------------------------------------
+
+                    # MONTOS CARGO / ABONO
+
+                    # ------------------------------------------------
+
+
+
+                    monto_abono = None
+
+                    monto_cargo = None
+
+
+
+                    if cargo_abono == "A":
+
+                        monto_abono = abs(monto)
+
+
+
+                    elif cargo_abono == "C":
+
+                        monto_cargo = abs(monto)
+
+
+
+                    # ------------------------------------------------
+
+                    # TIPO MOVIMIENTO
+
+                    # ------------------------------------------------
+
+
+
+                    if cargo_abono == "A":
+
+                        tipo_movimiento = "ABONO"
+
+                    elif cargo_abono == "C":
+
+                        tipo_movimiento = "CARGO"
+
+                    else:
+
+                        tipo_movimiento = cargo_abono
+
+
+
+                    movimiento = MovimientoBancario(
+
+                        importacion_bancaria_id=importacion.id,
+
+                        fecha_movimiento=fecha,
+
+                        descripcion_original=descripcion,
+
+                        numero_documento=numero_documento,
+
+                        sucursal=sucursal,
+
+                        tipo_movimiento=tipo_movimiento,
+
+                        monto=monto,
+
+                        cargo_abono=cargo_abono,
+
+                        monto_abono=monto_abono,
+
+                        monto_cargo=monto_cargo,
+
+                        saldo_diario=None,
+
+                        rut_pagador_detectado=rut_detectado,
+
+                        nombre_pagador_detectado=None,
+
+                    )
+
+
+
+                    db.add(movimiento)
+
+
+
+                    fechas.append(fecha)
+
+                    cantidad_importados += 1
+
+
+
+                except Exception:
+
+                    # Una fila inválida no debe guardar datos
+
+                    # incompletos. Se ignora por ahora.
+
+                    continue
+
+
+
+            if cantidad_importados == 0:
+
+                db.rollback()
+
+
+
+                raise HTTPException(
+
+                    status_code=400,
+
+                    detail=(
+
+                        "No se pudo importar ningún movimiento "
+
+                        "válido de la cartola."
+
+                    ),
+
+                )
+
+
+
+            # ------------------------------------------------
+
+            # ACTUALIZAR IMPORTACIÓN
+
+            # ------------------------------------------------
+
+
+
+            importacion.cantidad_registros = cantidad_importados
+
+            importacion.estado = "importada"
+
+
+
+            if fechas:
+
+                importacion.fecha_desde = min(fechas)
+
+                importacion.fecha_hasta = max(fechas)
+
+
+
+            db.commit()
+
+
+
+            return {
+
+                "mensaje": "Cartola Santander importada correctamente.",
+
+                "importacion_id": importacion.id,
+
+                "archivo": nombre_archivo,
+
+                "cuenta_bancaria_gh_id": cuenta_bancaria_gh_id,
+
+                "movimientos_importados": cantidad_importados,
+
+                "rut_detectados": cantidad_rut_detectado,
+
+                "requieren_revision": cantidad_revision,
+
+                "fecha_desde": (
+
+                    min(fechas).isoformat()
+
+                    if fechas
+
+                    else None
+
+                ),
+
+                "fecha_hasta": (
+
+                    max(fechas).isoformat()
+
+                    if fechas
+
+                    else None
+
+                ),
+
+            }
+
+
+
+        except HTTPException:
+
+            raise
+
+
+
+        except Exception as e:
+
+            db.rollback()
+
+
+
+            raise HTTPException(
+
+                status_code=500,
+
+                detail=(
+
+                    "Ocurrió un error al importar la cartola Santander: "
+
+                    f"{str(e)}"
+
+                ),
+
+            )
+
+# ============================================================
+# REPROCESAR RUT DE MOVIMIENTOS BANCARIOS
+# ============================================================
+
+@app.post("/api/movimientos-bancarios/reprocesar-rut")
+def reprocesar_rut_movimientos_bancarios(
+    importacion_bancaria_id: int | None = None,
+):
+    """Reprocesa las descripciones de movimientos ya importados."""
+    with SessionLocal() as db:
+        try:
+            stmt = select(MovimientoBancario).where(
+                MovimientoBancario.rut_pagador_detectado.is_(None)
+            )
+
+            if importacion_bancaria_id is not None:
+                stmt = stmt.where(
+                    MovimientoBancario.importacion_bancaria_id
+                    == importacion_bancaria_id
+                )
+
+            movimientos = db.scalars(stmt).all()
+            revisados = 0
+            rut_detectados = 0
+
+            for movimiento in movimientos:
+                revisados += 1
+                rut_detectado = detectar_rut_en_texto(
+                    movimiento.descripcion_original
+                )
+
+                if rut_detectado:
+                    movimiento.rut_pagador_detectado = rut_detectado
+                    rut_detectados += 1
+
+            db.commit()
+
+            return {
+                "mensaje": "RUT de movimientos reprocesados correctamente.",
+                "importacion_bancaria_id": importacion_bancaria_id,
+                "movimientos_revisados": revisados,
+                "rut_detectados": rut_detectados,
+                "requieren_revision": revisados - rut_detectados,
+            }
+
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Ocurrió un error al reprocesar los RUT: "
+                    f"{str(e)}"
+                ),
+            )
+
+# ============================================================
+# EVALUACIONES DE CRÉDITO
+# ============================================================
+
+@app.post(
+    "/api/evaluaciones-credito",
+    response_model=EvaluacionCreditoRespuesta,
+)
+def crear_evaluacion_credito(
+    datos: EvaluacionCreditoCrear,
+):
+    """Crea una nueva evaluación de crédito para un cliente."""
+    with SessionLocal() as db:
+        try:
+            cliente = db.get(Cliente, datos.cliente_id)
+
+            if cliente is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="El cliente indicado no existe.",
+                )
+
+            evaluacion = EvaluacionCredito(
+                cliente_id=datos.cliente_id,
+                fecha_solicitud=(
+                    datos.fecha_solicitud
+                    if datos.fecha_solicitud is not None
+                    else date.today()
+                ),
+                estado="PENDIENTE",
+                resultado="PENDIENTE",
+                trayectoria_cumplida=datos.trayectoria_cumplida,
+                tipo_trayectoria=datos.tipo_trayectoria,
+                cantidad_operaciones_trayectoria=(
+                    datos.cantidad_operaciones_trayectoria
+                ),
+                fecha_validacion_trayectoria=(
+                    datos.fecha_validacion_trayectoria
+                ),
+                usuario_validacion_trayectoria_id=(
+                    datos.usuario_validacion_trayectoria_id
+                ),
+                observacion_trayectoria=(
+                    datos.observacion_trayectoria
+                ),
+                monto_solicitado=datos.monto_solicitado,
+                dias_credito_solicitados=(
+                    datos.dias_credito_solicitados
+                ),
+                observaciones=datos.observaciones,
+            )
+
+            db.add(evaluacion)
+            db.commit()
+            db.refresh(evaluacion)
+
+            return evaluacion
+
+        except HTTPException:
+            raise
+
+        except Exception as e:
+            db.rollback()
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Ocurrió un error al crear la evaluación de crédito: "
+                    f"{str(e)}"
+                ),
+            )
+@app.get(
+    "/api/evaluaciones-credito",
+    response_model=list[EvaluacionCreditoRespuesta],
+)
+def listar_evaluaciones_credito(
+    cliente_id: int | None = None,
+):
+    """Lista las evaluaciones de crédito, opcionalmente filtradas por cliente."""
+    with SessionLocal() as db:
+        try:
+            stmt = select(EvaluacionCredito).order_by(
+                EvaluacionCredito.id.desc()
+            )
+
+            if cliente_id is not None:
+                stmt = stmt.where(
+                    EvaluacionCredito.cliente_id == cliente_id
+                )
+
+            evaluaciones = db.scalars(stmt).all()
+
+            return evaluaciones
+
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Ocurrió un error al listar las evaluaciones de crédito: "
+                    f"{str(e)}"
+                ),
+            )            
+@app.post(
+    "/api/evaluaciones-credito/{evaluacion_id}/decision",
+    response_model=EvaluacionCreditoRespuesta,
+)
+def decidir_evaluacion_credito(
+    evaluacion_id: int,
+    datos: DecisionCredito,
+):
+    """Registra la decisión de Gerencia sobre una evaluación de crédito."""
+
+    RESULTADOS_PERMITIDOS = {
+        "APROBADO",
+        "APROBADO_CONDICIONES",
+        "RECHAZADO",
+        "PENDIENTE",
+    }
+
+    resultado = datos.resultado.strip().upper()
+
+    if resultado not in RESULTADOS_PERMITIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Resultado de decisión no permitido. "
+                "Resultados válidos: "
+                + ", ".join(sorted(RESULTADOS_PERMITIDOS))
+            ),
+        )
+
+    with SessionLocal() as db:
+        evaluacion = db.get(EvaluacionCredito, evaluacion_id)
+
+        if evaluacion is None:
+            raise HTTPException(
+                status_code=404,
+                detail="La evaluación de crédito no existe.",
+            )
+
+        # --------------------------------------------------------
+        # VOLVER A PENDIENTE
+        # --------------------------------------------------------
+
+        if resultado == "PENDIENTE":
+            evaluacion.resultado = "PENDIENTE"
+            evaluacion.estado = "PENDIENTE"
+            evaluacion.monto_aprobado = None
+            evaluacion.dias_credito_aprobados = None
+            evaluacion.fecha_decision = None
+            evaluacion.usuario_decision_id = None
+            evaluacion.observaciones = datos.observaciones
+
+            db.commit()
+            db.refresh(evaluacion)
+
+            return evaluacion
+
+        # --------------------------------------------------------
+        # VALIDACIONES PARA APROBACIONES
+        # --------------------------------------------------------
+
+        if resultado in {"APROBADO", "APROBADO_CONDICIONES"}:
+
+            if datos.monto_aprobado is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Debe indicar el monto aprobado.",
+                )
+
+            if datos.monto_aprobado <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El monto aprobado debe ser mayor que cero.",
+                )
+
+            if datos.dias_credito_aprobados is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Debe indicar los días de crédito aprobados.",
+                )
+
+            if datos.dias_credito_aprobados < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Los días de crédito aprobados "
+                        "no pueden ser negativos."
+                    ),
+                )
+
+            # La trayectoria comercial debe estar validada.
+            if not evaluacion.trayectoria_cumplida:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No se puede aprobar el crédito porque "
+                        "la trayectoria comercial todavía no está validada."
+                    ),
+                )
+
+            # ----------------------------------------------------
+            # DOCUMENTACIÓN OBLIGATORIA
+            # ----------------------------------------------------
+
+            TIPOS_DOCUMENTOS_REQUERIDOS = [
+                "ESCRITURA_CONSTITUCION",
+                "CEDULA_DUENOS",
+                "DICOM",
+                "CERTIFICADO_NO_DEUDA_TGR",
+                "CARPETA_TRIBUTARIA_SII",
+            ]
+
+            documentos = (
+                db.execute(
+                    select(DocumentoCredito)
+                    .where(
+                        DocumentoCredito.evaluacion_credito_id
+                        == evaluacion_id
+                    )
+                    .order_by(DocumentoCredito.id.desc())
+                )
+                .scalars()
+                .all()
+            )
+
+            documentos_por_tipo = {}
+
+            for documento in documentos:
+                if documento.tipo_documento not in documentos_por_tipo:
+                    documentos_por_tipo[documento.tipo_documento] = documento
+
+            faltantes = [
+                tipo
+                for tipo in TIPOS_DOCUMENTOS_REQUERIDOS
+                if tipo not in documentos_por_tipo
+            ]
+
+            if faltantes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No se puede aprobar el crédito porque faltan "
+                        "documentos obligatorios: "
+                        + ", ".join(faltantes)
+                    ),
+                )
+
+            no_aprobados = [
+                documento.tipo_documento
+                for documento in documentos_por_tipo.values()
+                if (
+                    documento.tipo_documento
+                    in TIPOS_DOCUMENTOS_REQUERIDOS
+                    and documento.estado_revision != "APROBADO"
+                )
+            ]
+
+            if no_aprobados:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No se puede aprobar el crédito porque existen "
+                        "documentos obligatorios que no están aprobados: "
+                        + ", ".join(no_aprobados)
+                    ),
+                )
+
+        # --------------------------------------------------------
+        # REGISTRAR DECISIÓN
+        # --------------------------------------------------------
+
+        evaluacion.resultado = resultado
+        evaluacion.estado = resultado
+
+        if resultado == "RECHAZADO":
+            evaluacion.monto_aprobado = None
+            evaluacion.dias_credito_aprobados = None
+
+        else:
+            evaluacion.monto_aprobado = datos.monto_aprobado
+            evaluacion.dias_credito_aprobados = (
+                datos.dias_credito_aprobados
+            )
+
+        evaluacion.fecha_decision = date.today()
+        evaluacion.observaciones = datos.observaciones
+
+        # --------------------------------------------------------
+        # CREAR / ACTUALIZAR CRÉDITO VIGENTE
+        # --------------------------------------------------------
+        #
+        # Solo APROBADO genera crédito operativo.
+        #
+        # APROBADO_CONDICIONES queda registrado como decisión,
+        # pero todavía no activa automáticamente el crédito.
+        #
+
+        if resultado == "APROBADO":
+
+            credito = (
+                db.execute(
+                    select(CreditoCliente)
+                    .where(
+                        CreditoCliente.cliente_id
+                        == evaluacion.cliente_id,
+                        CreditoCliente.activo.is_(True),
+                    )
+                    .order_by(CreditoCliente.id.desc())
+                )
+                .scalars()
+                .first()
+            )
+
+            if credito is None:
+                credito = CreditoCliente(
+                    cliente_id=evaluacion.cliente_id,
+                    dias_credito=evaluacion.dias_credito_aprobados,
+                    limite_credito=evaluacion.monto_aprobado,
+                    fecha_inicio=date.today(),
+                    fecha_revision=None,
+                    activo=True,
+                    observaciones=(
+                        f"Crédito aprobado mediante evaluación "
+                        f"#{evaluacion.id}."
+                    ),
+                )
+
+                db.add(credito)
+
+            else:
+                credito.dias_credito = (
+                    evaluacion.dias_credito_aprobados
+                )
+                credito.limite_credito = (
+                    evaluacion.monto_aprobado
+                )
+                credito.fecha_inicio = date.today()
+                credito.activo = True
+                credito.observaciones = (
+                    f"Crédito actualizado mediante evaluación "
+                    f"#{evaluacion.id}."
+                )
+
+        # --------------------------------------------------------
+        # RECHAZADO
+        # --------------------------------------------------------
+        #
+        # Una evaluación rechazada no crea un crédito.
+        # Tampoco modificamos automáticamente un crédito anterior,
+        # porque eso requiere una decisión de negocio explícita.
+        #
+
+        db.commit()
+        db.refresh(evaluacion)
+
+        return evaluacion
+@app.post(
+    "/api/evaluaciones-credito/{evaluacion_id}/documentos",
+    response_model=DocumentoCreditoRespuesta,
+)
+async def subir_documento_credito(
+    evaluacion_id: int,
+    tipo_documento: str = Form(...),
+    archivo: UploadFile = File(...),
+    fecha_documento: date | None = Form(None),
+    fecha_vencimiento: date | None = Form(None),
+    observaciones: str | None = Form(None),
+):
+    """Sube y registra un documento asociado a una evaluación de crédito."""
+
+    TIPOS_DOCUMENTO_PERMITIDOS = {
+        "ESCRITURA_CONSTITUCION",
+        "CEDULA_DUENOS",
+        "DICOM",
+        "CERTIFICADO_NO_DEUDA_TGR",
+        "CARPETA_TRIBUTARIA_SII",
+    }
+
+    MAX_TAMANO_BYTES = 10 * 1024 * 1024  # 10 MB
+
+    with SessionLocal() as db:
+        try:
+            # 1. Verificar que la evaluación exista
+            evaluacion = db.get(EvaluacionCredito, evaluacion_id)
+
+            if evaluacion is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="La evaluación de crédito no existe.",
+                )
+
+            # 2. Validar tipo de documento
+            tipo_documento = tipo_documento.strip().upper()
+
+            if tipo_documento not in TIPOS_DOCUMENTO_PERMITIDOS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Tipo de documento no permitido. "
+                        "Tipos válidos: "
+                        + ", ".join(sorted(TIPOS_DOCUMENTO_PERMITIDOS))
+                    ),
+                )
+
+            # 3. Validar nombre del archivo
+            nombre_original = Path(archivo.filename or "").name
+
+            if not nombre_original:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El archivo no tiene un nombre válido.",
+                )
+
+            # 4. Leer archivo
+            contenido = await archivo.read()
+
+            if not contenido:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El archivo está vacío.",
+                )
+
+            # 5. Validar tamaño
+            if len(contenido) > MAX_TAMANO_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El archivo supera el tamaño máximo permitido de 10 MB.",
+                )
+
+            # 6. Calcular hash SHA-256
+            hash_archivo = hashlib.sha256(contenido).hexdigest()
+                        # 6.1. Verificar si el mismo archivo ya fue cargado
+            documento_existente = db.scalars(
+                select(DocumentoCredito)
+                .where(
+                    DocumentoCredito.evaluacion_credito_id == evaluacion_id,
+                    DocumentoCredito.hash_archivo == hash_archivo,
+                )
+            ).first()
+
+            if documento_existente is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Este archivo ya fue cargado en esta evaluación. "
+                        f"Documento existente ID: {documento_existente.id}."
+                    ),
+                )
+            # 7. Crear carpeta específica de la evaluación
+            carpeta_base = Path("uploads") / "creditos" / str(evaluacion_id)
+            carpeta_base.mkdir(parents=True, exist_ok=True)
+
+            # 8. Crear nombre físico seguro
+            extension = Path(nombre_original).suffix.lower()
+
+            nombre_fisico = (
+                f"{tipo_documento}_{hash_archivo[:16]}{extension}"
+            )
+
+            ruta_archivo = carpeta_base / nombre_fisico
+
+            # 9. Guardar archivo
+            ruta_archivo.write_bytes(contenido)
+
+            # 10. Registrar documento en base de datos
+            documento = DocumentoCredito(
+                evaluacion_credito_id=evaluacion_id,
+                tipo_documento=tipo_documento,
+                nombre_archivo=nombre_original,
+                ruta_archivo=str(ruta_archivo),
+                tipo_mime=archivo.content_type,
+                tamano_bytes=len(contenido),
+                hash_archivo=hash_archivo,
+                fecha_documento=fecha_documento,
+                fecha_vencimiento=fecha_vencimiento,
+                estado_revision="RECIBIDO",
+                observaciones=observaciones,
+            )
+
+            db.add(documento)
+            db.commit()
+            db.refresh(documento)
+
+            return documento
+
+        except HTTPException:
+            raise
+
+        except Exception as e:
+            db.rollback()
+
+            # Si ocurrió un error después de guardar el archivo,
+            # intentamos eliminarlo para no dejar archivos huérfanos.
+            try:
+                if "ruta_archivo" in locals() and ruta_archivo.exists():
+                    ruta_archivo.unlink()
+            except Exception:
+                pass
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"Ocurrió un error al subir el documento: {str(e)}",
+            )
+
+    """Lista los documentos asociados a una evaluación de crédito."""
+    with SessionLocal() as db:
+        try:
+            evaluacion = db.get(
+                EvaluacionCredito,
+                evaluacion_id,
+            )
+
+            if evaluacion is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="La evaluación de crédito no existe.",
+                )
+
+            stmt = (
+                select(DocumentoCredito)
+                .where(
+                    DocumentoCredito.evaluacion_credito_id
+                    == evaluacion_id
+                )
+                .order_by(DocumentoCredito.id.asc())
+            )
+
+            documentos = db.scalars(stmt).all()
+
+            return documentos
+
+        except HTTPException:
+            raise
+
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Ocurrió un error al listar los documentos "
+                    "de crédito: "
+                    f"{str(e)}"
+                ),
+            )            
+@app.get(
+    "/api/evaluaciones-credito/{evaluacion_id}/documentacion",
+    response_model=DocumentacionCreditoRespuesta,
+)
+def obtener_documentacion_credito(evaluacion_id: int):
+    """Obtiene el estado de la documentación requerida para una evaluación de crédito."""
+
+    DOCUMENTOS_REQUERIDOS = [
+        "ESCRITURA_CONSTITUCION",
+        "CEDULA_DUENOS",
+        "DICOM",
+        "CERTIFICADO_NO_DEUDA_TGR",
+        "CARPETA_TRIBUTARIA_SII",
+    ]
+
+    with SessionLocal() as db:
+        evaluacion = db.get(EvaluacionCredito, evaluacion_id)
+
+        if evaluacion is None:
+            raise HTTPException(
+                status_code=404,
+                detail="La evaluación de crédito no existe.",
+            )
+
+        documentos = db.scalars(
+            select(DocumentoCredito)
+            .where(
+                DocumentoCredito.evaluacion_credito_id == evaluacion_id
+            )
+            .order_by(DocumentoCredito.id.desc())
+        ).all()
+
+        documentos_por_tipo = {}
+
+        for documento in documentos:
+            if documento.tipo_documento not in documentos_por_tipo:
+                documentos_por_tipo[documento.tipo_documento] = documento
+
+        estados = []
+
+        for tipo_documento in DOCUMENTOS_REQUERIDOS:
+            documento = documentos_por_tipo.get(tipo_documento)
+
+            estados.append(
+                {
+                    "tipo_documento": tipo_documento,
+                    "requerido": True,
+                    "presente": documento is not None,
+                    "estado_revision": (
+                        documento.estado_revision
+                        if documento is not None
+                        else None
+                    ),
+                    "documento_id": (
+                        documento.id
+                        if documento is not None
+                        else None
+                    ),
+                }
+            )
+
+        documentos_presentes = sum(
+            1 for estado in estados if estado["presente"]
+        )
+
+        documentos_requeridos = len(DOCUMENTOS_REQUERIDOS)
+        documentos_faltantes = (
+            documentos_requeridos - documentos_presentes
+        )
+
+        return {
+            "evaluacion_credito_id": evaluacion_id,
+            "documentos_requeridos": documentos_requeridos,
+            "documentos_presentes": documentos_presentes,
+            "documentos_faltantes": documentos_faltantes,
+            "documentacion_completa": documentos_faltantes == 0,
+            "estados": estados,
+        }     
+class RevisarDocumentoCredito(BaseModel):
+    estado_revision: str
+    observaciones: str | None = None
+    usuario_revision_id: int | None = None
+
+
+@app.patch(
+    "/api/evaluaciones-credito/{evaluacion_id}/documentos/{documento_id}/revision",
+    response_model=DocumentoCreditoRespuesta,
+)
+def revisar_documento_credito(
+    evaluacion_id: int,
+    documento_id: int,
+    datos: RevisarDocumentoCredito,
+):
+    """Actualiza el estado de revisión de un documento de crédito."""
+
+    ESTADOS_PERMITIDOS = {
+        "RECIBIDO",
+        "EN_REVISION",
+        "APROBADO",
+        "OBSERVADO",
+        "RECHAZADO",
+        "VENCIDO",
+    }
+
+    estado = datos.estado_revision.strip().upper()
+
+    if estado not in ESTADOS_PERMITIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Estado de revisión no permitido. "
+                "Estados válidos: "
+                + ", ".join(sorted(ESTADOS_PERMITIDOS))
+            ),
+        )
+
+    with SessionLocal() as db:
+        documento = db.get(DocumentoCredito, documento_id)
+
+        if documento is None:
+            raise HTTPException(
+                status_code=404,
+                detail="El documento de crédito no existe.",
+            )
+
+        if documento.evaluacion_credito_id != evaluacion_id:
+            raise HTTPException(
+                status_code=400,
+                detail="El documento no pertenece a la evaluación indicada.",
+            )
+
+        documento.estado_revision = estado
+        documento.observaciones = datos.observaciones
+
+        if datos.usuario_revision_id is not None:
+            usuario = db.get(Usuario, datos.usuario_revision_id)
+
+            if usuario is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="El usuario de revisión no existe.",
+                )
+
+            documento.usuario_revision_id = datos.usuario_revision_id
+
+        documento.fecha_revision = datetime.utcnow()
+
+        db.commit()
+        db.refresh(documento)
+
+        return documento     
+
+      
+
+
+@app.post(
+    "/api/evaluaciones-credito/{evaluacion_id}/decision",
+    response_model=EvaluacionCreditoRespuesta,
+)
+def decidir_evaluacion_credito(
+    evaluacion_id: int,
+    datos: DecisionCredito,
+):
+    """Registra la decisión de Gerencia sobre una evaluación de crédito."""
+
+    RESULTADOS_PERMITIDOS = {
+        "APROBADO",
+        "APROBADO_CONDICIONES",
+        "RECHAZADO",
+        "PENDIENTE",
+    }
+
+    resultado = datos.resultado.strip().upper()
+
+    if resultado not in RESULTADOS_PERMITIDOS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Resultado de decisión no permitido. "
+                "Resultados válidos: "
+                + ", ".join(sorted(RESULTADOS_PERMITIDOS))
+            ),
+        )
+
+    with SessionLocal() as db:
+        evaluacion = db.get(EvaluacionCredito, evaluacion_id)
+
+        if evaluacion is None:
+            raise HTTPException(
+                status_code=404,
+                detail="La evaluación de crédito no existe.",
+            )
+
+        # Si se mantiene pendiente, no se requiere completar
+        # documentación ni trayectoria.
+        if resultado == "PENDIENTE":
+            evaluacion.resultado = "PENDIENTE"
+            evaluacion.estado = "PENDIENTE"
+            evaluacion.monto_aprobado = None
+            evaluacion.dias_credito_aprobados = None
+            evaluacion.fecha_decision = None
+            evaluacion.usuario_decision_id = None
+            evaluacion.observaciones = datos.observaciones
+
+            db.commit()
+            db.refresh(evaluacion)
+
+            return evaluacion
+
+        # Una decisión de aprobación requiere monto y plazo.
+        if resultado in {"APROBADO", "APROBADO_CONDICIONES"}:
+            if datos.monto_aprobado is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Debe indicar el monto aprobado.",
+                )
+
+            if datos.monto_aprobado <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El monto aprobado debe ser mayor que cero.",
+                )
+
+            if datos.dias_credito_aprobados is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Debe indicar los días de crédito aprobados.",
+                )
+
+            if datos.dias_credito_aprobados < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Los días de crédito aprobados no pueden ser negativos.",
+                )
+
+            # La trayectoria comercial debe estar validada
+            # antes de aprobar el crédito.
+            if not evaluacion.trayectoria_cumplida:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No se puede aprobar el crédito porque "
+                        "la trayectoria comercial todavía no está validada."
+                    ),
+                )
+
+            # Obtener el último documento registrado de cada tipo.
+            TIPOS_DOCUMENTOS_REQUERIDOS = [
+                "ESCRITURA_CONSTITUCION",
+                "CEDULA_DUENOS",
+                "DICOM",
+                "CERTIFICADO_NO_DEUDA_TGR",
+                "CARPETA_TRIBUTARIA_SII",
+            ]
+
+            documentos = (
+                db.execute(
+                    select(DocumentoCredito)
+                    .where(
+                        DocumentoCredito.evaluacion_credito_id
+                        == evaluacion_id
+                    )
+                    .order_by(DocumentoCredito.id.desc())
+                )
+                .scalars()
+                .all()
+            )
+
+            documentos_por_tipo = {}
+
+            for documento in documentos:
+                if documento.tipo_documento not in documentos_por_tipo:
+                    documentos_por_tipo[documento.tipo_documento] = documento
+
+            faltantes = [
+                tipo
+                for tipo in TIPOS_DOCUMENTOS_REQUERIDOS
+                if tipo not in documentos_por_tipo
+            ]
+
+            if faltantes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No se puede aprobar el crédito porque faltan "
+                        "documentos obligatorios: "
+                        + ", ".join(faltantes)
+                    ),
+                )
+
+            no_aprobados = [
+                documento.tipo_documento
+                for documento in documentos_por_tipo.values()
+                if documento.tipo_documento in TIPOS_DOCUMENTOS_REQUERIDOS
+                and documento.estado_revision != "APROBADO"
+            ]
+
+            if no_aprobados:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No se puede aprobar el crédito porque existen "
+                        "documentos obligatorios que no están aprobados: "
+                        + ", ".join(no_aprobados)
+                    ),
+                )
+
+        # Una decisión RECHAZADO no requiere que el expediente
+        # esté completo. Gerencia puede rechazar por antecedentes,
+        # política comercial u otros motivos.
+        evaluacion.resultado = resultado
+        evaluacion.estado = resultado
+
+        if resultado == "RECHAZADO":
+            evaluacion.monto_aprobado = None
+            evaluacion.dias_credito_aprobados = None
+        else:
+            evaluacion.monto_aprobado = datos.monto_aprobado
+            evaluacion.dias_credito_aprobados = (
+                datos.dias_credito_aprobados
+            )
+
+        evaluacion.fecha_decision = date.today()
+        evaluacion.observaciones = datos.observaciones
+
+        db.commit()
+        db.refresh(evaluacion)
+
+        return evaluacion          
+
+@app.patch(
+    "/api/evaluaciones-credito/{evaluacion_id}/trayectoria",
+    response_model=EvaluacionCreditoRespuesta,
+)
+def validar_trayectoria_credito(
+    evaluacion_id: int,
+    datos: ValidacionTrayectoriaCredito,
+):
+    """Registra la validación de la trayectoria comercial del cliente."""
+
+    with SessionLocal() as db:
+        evaluacion = db.get(EvaluacionCredito, evaluacion_id)
+
+        if evaluacion is None:
+            raise HTTPException(
+                status_code=404,
+                detail="La evaluación de crédito no existe.",
+            )
+
+        if datos.cumplida:
+            if not datos.tipo_trayectoria:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Debe indicar el tipo de trayectoria.",
+                )
+
+            if datos.cantidad_operaciones is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Debe indicar la cantidad de operaciones consideradas.",
+                )
+
+            if datos.cantidad_operaciones <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="La cantidad de operaciones debe ser mayor que cero.",
+                )
+
+            evaluacion.trayectoria_cumplida = True
+            evaluacion.tipo_trayectoria = datos.tipo_trayectoria.strip()
+            evaluacion.cantidad_operaciones_trayectoria = datos.cantidad_operaciones
+            evaluacion.fecha_validacion_trayectoria = (
+                datos.fecha_validacion or date.today()
+            )
+            evaluacion.observacion_trayectoria = datos.observacion
+
+            if datos.usuario_validacion_id is not None:
+                usuario = db.get(Usuario, datos.usuario_validacion_id)
+
+                if usuario is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="El usuario indicado no existe.",
+                    )
+
+                evaluacion.usuario_validacion_trayectoria_id = (
+                    datos.usuario_validacion_id
+                )
+
+        else:
+            evaluacion.trayectoria_cumplida = False
+            evaluacion.tipo_trayectoria = datos.tipo_trayectoria
+            evaluacion.cantidad_operaciones_trayectoria = (
+                datos.cantidad_operaciones
+            )
+            evaluacion.fecha_validacion_trayectoria = (
+                datos.fecha_validacion or date.today()
+            )
+            evaluacion.observacion_trayectoria = datos.observacion
+            evaluacion.usuario_validacion_trayectoria_id = (
+                datos.usuario_validacion_id
+            )
+
+        db.commit()
+        db.refresh(evaluacion)
+
+        return evaluacion        
+
+
+        
