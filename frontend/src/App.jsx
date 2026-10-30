@@ -7,7 +7,7 @@ import EvaluacionesCredito from './components/EvaluacionesCredito'
 import ConciliacionView from './components/ConciliacionView'
 
 
-const API_URL = 'http://localhost:8000'
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 
 const formularioInicial = {

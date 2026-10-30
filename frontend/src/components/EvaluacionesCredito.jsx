@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import RevisionDocumentoCredito from './RevisionDocumentoCredito'
 
-const API_URL = 'http://localhost:8000'
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 const DOCUMENTOS_REQUERIDOS = [
   {
